@@ -75,6 +75,8 @@ def parse_args():
                         help="Top-M classes for gating")
     parser.add_argument("--num-views", type=int, default=5,
                         help="Number of attribute views (K)")
+    parser.add_argument("--text-model", type=str, default="clip:ViT-B/32",
+                        help="Text model for embeddings (default: clip:ViT-B/32)")
     
     # 단계별 실행
     parser.add_argument("--skip-detection", action="store_true",
@@ -93,6 +95,31 @@ def parse_args():
                         help="Verbose output")
     
     return parser.parse_args()
+
+
+def get_text_embeddings_with_clip(names: list, device: str = "cuda", 
+                                   text_model_name: str = "clip:ViT-B/32") -> torch.Tensor:
+    """
+    CLIP을 사용하여 텍스트 임베딩 생성 (MobileCLIP 의존성 제거)
+    
+    Args:
+        names: 클래스 이름 리스트
+        device: 디바이스
+        text_model_name: 텍스트 모델 이름 (default: clip:ViT-B/32)
+    """
+    from ultralytics.nn.text_model import build_text_model
+    
+    print(f"  Building text embeddings for {len(names)} classes using {text_model_name}...")
+    text_model = build_text_model(text_model_name, device=device)
+    text_model.eval()
+    
+    with torch.no_grad():
+        tokens = text_model.tokenize(names)
+        txt_feats = text_model.encode_text(tokens)
+        # [1, num_classes, embed_dim] 형태로 변환
+        txt_feats = txt_feats.unsqueeze(0)
+    
+    return txt_feats
 
 
 def run_detection_phase(config: ExperimentConfig,
@@ -120,9 +147,9 @@ def run_detection_phase(config: ExperimentConfig,
         top_k=config.top_m_classes,
     )
     
-    # 모델 설정
+    # 모델 설정 - CLIP 직접 사용 (MobileCLIP 의존성 제거)
     names = [name.split("/")[0] for name in list(class_names.values())]
-    tpe = model.get_text_pe(names)
+    tpe = get_text_embeddings_with_clip(names, device=config.device, text_model_name=config.text_model)
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
@@ -186,7 +213,7 @@ def run_embedding_phase(config: ExperimentConfig,
     print("="*60)
     
     generator = AttributeEmbeddingGenerator(
-        text_model_name="clip:ViT-B/32",
+        text_model_name=config.text_model,
         device=config.device,
         num_views=config.num_attribute_views,
     )
@@ -262,7 +289,7 @@ def run_evaluation_phase(config: ExperimentConfig,
     # 3.4 Artifactness Score (Track B)
     print("\n--- Artifactness Score Calculation ---")
     art_scorer = ArtifactnessScorer(
-        text_model_name="clip:ViT-B/32",
+        text_model_name=config.text_model,
         device=config.device,
         method="margin",
     )
@@ -359,6 +386,7 @@ def main():
     config.iou_threshold = args.iou_threshold
     config.top_m_classes = args.top_m
     config.num_attribute_views = args.num_views
+    config.text_model = args.text_model
     
     # 출력 디렉토리
     if args.output_dir:
@@ -425,7 +453,10 @@ def main():
         )
         
         # 캐시 저장
-        generator = AttributeEmbeddingGenerator(device=config.device)
+        generator = AttributeEmbeddingGenerator(
+            text_model_name=config.text_model,
+            device=config.device
+        )
         generator.save_cache(attribute_cache, output_dir / "attribute_cache.json")
     else:
         # 캐시 로드

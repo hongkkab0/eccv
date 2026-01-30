@@ -40,6 +40,7 @@ class ExperimentConfig:
     # === A-4: H1 검증 설정 ===
     top_m_classes: int = 10  # Top-M 클래스 게이팅
     num_attribute_views: int = 5  # K개의 attribute view
+    text_model: str = "clip:ViT-B/32"  # 텍스트 임베딩 모델 (MobileCLIP 의존성 제거)
     
     # === 출력 설정 ===
     output_dir: str = "experiments/h1_semantic_fp/outputs"
