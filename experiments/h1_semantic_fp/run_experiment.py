@@ -153,8 +153,21 @@ def run_detection_phase(config: ExperimentConfig,
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
+    # cfg 객체 생성 (build_yolo_dataset에 필요)
+    from types import SimpleNamespace
+    dataset_cfg = SimpleNamespace(
+        imgsz=config.imgsz,
+        rect=True,
+        cache=False,
+        single_cls=False,
+        task='detect',
+        classes=None,
+        fraction=1.0,
+        load_vp=False,
+    )
+    
     dataset = build_yolo_dataset(
-        None,  # args
+        dataset_cfg,
         data.get('val'),
         batch=config.batch_size,
         data=data,
