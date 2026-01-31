@@ -216,8 +216,10 @@ def run_detection_phase(config: ExperimentConfig,
         if max_images and batch_idx >= max_images:
             break
         
-        # 이미지 처리
-        imgs = batch["img"].to(model.device)
+        # 이미지 처리 - float32로 변환 및 정규화 (0-1 범위)
+        imgs = batch["img"].to(model.device).float()
+        if imgs.max() > 1.0:
+            imgs = imgs / 255.0
         
         # 추론
         with torch.no_grad():
