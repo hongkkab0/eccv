@@ -147,8 +147,9 @@ def run_detection_phase(config: ExperimentConfig,
         top_k=config.top_m_classes,
     )
     
-    # 모델 설정 - CLIP 직접 사용 (MobileCLIP 의존성 제거)
-    names = [name.split("/")[0] for name in list(class_names.values())]
+    # 모델 설정 - data yaml 기준 이름 순서 사용
+    names = [class_names[i] for i in range(len(class_names))]
+    names = [name.split("/")[0] for name in names]
     tpe = get_text_embeddings_with_clip(names, device=config.device, text_model_name=config.text_model)
     model.set_classes(names, tpe)
     
@@ -230,6 +231,7 @@ def run_detection_phase(config: ExperimentConfig,
         
         # Detection 로깅 - GT와 매칭
         for b, result in enumerate(results):
+            logger.stats["total_images"] += 1
             if result.boxes is None or len(result.boxes) == 0:
                 continue
             
@@ -385,7 +387,10 @@ def run_evaluation_phase(config: ExperimentConfig,
     
     # 이미지 디렉토리 (data yaml에서 가져옴)
     data = check_det_dataset(config.data_yaml)
-    image_dir = Path(data.get("path", "")) / "val2017"  # COCO/LVIS 기본 경로
+    val_path = data.get("val")
+    if isinstance(val_path, (list, tuple)):
+        val_path = val_path[0] if len(val_path) > 0 else ""
+    image_dir = Path(val_path).parent if val_path else Path(data.get("path", "")) / "val2017"
     
     # CLIP crop embedding으로 u_sem 계산
     u_sem_by_group = u_sem_calculator.compute_for_triad_split_with_images(
@@ -396,7 +401,10 @@ def run_evaluation_phase(config: ExperimentConfig,
     print(f"  u_sem statistics:")
     for group, stats in u_sem_stats.items():
         if isinstance(stats, dict):
-            print(f"    {group}: mean={stats.get('mean', 0):.4f}, std={stats.get('std', 0):.4f}")
+            def _fmt(v):
+                return f"{v:.8e}" if isinstance(v, float) else v
+            summary = {k: _fmt(v) for k, v in stats.items()}
+            print(f"    {group}: {summary}")
     
     # 3.4 Artifactness Score (Track B)
     print("\n--- Artifactness Score Calculation ---")
@@ -522,8 +530,14 @@ def main():
     # data["names"]는 {0: 'name0', 1: 'name1', ...} 또는 ['name0', 'name1', ...] 형태
     if isinstance(data["names"], dict):
         class_names = data["names"]
+        names = [class_names[i] for i in range(len(class_names))]
     else:
-        class_names = {i: name for i, name in enumerate(data["names"])}
+        names = list(data["names"])
+        class_names = {i: name for i, name in enumerate(names)}
+    
+    print(f"train: {data.get('train')}")
+    print(f"val: {data.get('val')}")
+    print(f"nc: {data.get('nc')}, names_len: {len(names)}")
     
     # Confounder indices도 동일한 인덱스 체계로 구축
     confounder_indices = build_confounder_set(class_names)

@@ -410,16 +410,15 @@ def analyze_u_sem_statistics(u_sem_by_group: Dict[str, np.ndarray]) -> Dict:
     for group, values in u_sem_by_group.items():
         if len(values) == 0:
             continue
-        
+        values = np.asarray(values)
         stats[group] = {
-            "count": len(values),
+            "count": int(len(values)),
+            "min": float(np.min(values)),
+            "p50": float(np.quantile(values, 0.50)),
+            "p95": float(np.quantile(values, 0.95)),
+            "max": float(np.max(values)),
             "mean": float(np.mean(values)),
             "std": float(np.std(values)),
-            "min": float(np.min(values)),
-            "max": float(np.max(values)),
-            "median": float(np.median(values)),
-            "q25": float(np.percentile(values, 25)),
-            "q75": float(np.percentile(values, 75)),
         }
     
     # Cohen's d 계산 (TP vs Semantic_FP)
