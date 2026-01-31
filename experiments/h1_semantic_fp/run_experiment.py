@@ -223,11 +223,47 @@ def run_detection_phase(config: ExperimentConfig,
         
         # 추론
         with torch.no_grad():
-            preds = model.predict(imgs, verbose=False)
+            results = model.predict(imgs, verbose=False, conf=config.conf_threshold)
         
-        # Detection 로깅
-        # TODO: region feature 추출 추가 필요
-        # 현재는 기본 detection 결과만 로깅
+        # Detection 로깅 - GT와 매칭
+        for b, result in enumerate(results):
+            logger.stats["total_images"] += 1
+            
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            
+            # Prediction 정보 추출
+            pred_boxes = result.boxes.xyxy.cpu()  # [N, 4]
+            pred_confs = result.boxes.conf.cpu()  # [N]
+            pred_classes = result.boxes.cls.cpu().int()  # [N]
+            
+            # GT 정보 추출 (batch에서)
+            batch_mask = batch["batch_idx"] == b
+            gt_boxes_norm = batch["bboxes"][batch_mask]  # normalized xywh
+            gt_classes = batch["cls"][batch_mask].squeeze(-1).int()
+            
+            # GT boxes를 xyxy로 변환 (이미지 크기 기준)
+            img_h, img_w = imgs.shape[2], imgs.shape[3]
+            if len(gt_boxes_norm) > 0:
+                gt_boxes = gt_boxes_norm.clone()
+                # xywh -> xyxy
+                gt_boxes[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * img_w
+                gt_boxes[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * img_h
+                gt_boxes[:, 2] = (gt_boxes_norm[:, 0] + gt_boxes_norm[:, 2] / 2) * img_w
+                gt_boxes[:, 3] = (gt_boxes_norm[:, 1] + gt_boxes_norm[:, 3] / 2) * img_h
+            else:
+                gt_boxes = torch.zeros((0, 4))
+            
+            # 이미지 ID
+            img_id = f"batch{batch_idx}_img{b}"
+            
+            # Logger에 전달
+            logger.process_batch(
+                preds=torch.cat([pred_boxes, pred_confs.unsqueeze(1), pred_classes.unsqueeze(1).float()], dim=1).unsqueeze(0),
+                gt_bboxes=[gt_boxes],
+                gt_classes=[gt_classes],
+                image_ids=[img_id],
+            )
         
         if verbose and batch_idx % 100 == 0:
             print(f"  Batch {batch_idx}: {logger.stats}")

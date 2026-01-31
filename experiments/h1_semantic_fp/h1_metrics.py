@@ -158,6 +158,19 @@ class H1Evaluator:
         Returns:
             H1VerificationResult
         """
+        # 빈 배열 체크
+        if len(u_sem_tp) == 0 or len(u_sem_semantic_fp) == 0:
+            print("WARNING: Empty arrays - cannot compute metrics")
+            return H1VerificationResult(
+                auroc_u_sem=0.5,
+                aupr_u_sem=0.5,
+                auroc_confidence=0.5,
+                cohens_d_u_sem=0.0,
+                cohens_d_confidence=0.0,
+                n_tp=len(u_sem_tp),
+                n_semantic_fp=len(u_sem_semantic_fp),
+            )
+        
         # 1. AUROC/AUPR for u_sem (Semantic FP를 positive로)
         auroc_u_sem, aupr_u_sem = compute_auroc_aupr(
             u_sem_semantic_fp, u_sem_tp
