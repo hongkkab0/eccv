@@ -120,8 +120,6 @@ class DetectionLogger:
         batch_size = len(image_ids)
         
         for b in range(batch_size):
-            self.stats["total_images"] += 1
-            
             # 현재 이미지의 predictions
             pred = preds[b] if preds.dim() == 3 else preds
             if pred.numel() == 0:
@@ -205,7 +203,7 @@ class DetectionLogger:
         
         # TP/FP 판정
         if len(gt_boxes) == 0:
-            # GT가 없으면 모든 detection은 FP
+            # GT가 없으면 모든 detection은 Background FP
             detection.is_tp = False
             detection.triad_label = "Background_FP"
         else:
@@ -214,8 +212,9 @@ class DetectionLogger:
             max_iou = det_gt_ious[max_iou_idx]
             matched_gt_class = int(gt_classes[max_iou_idx])
             
-            # TP 조건: IoU >= threshold AND 클래스 일치
-            if max_iou >= self.tp_iou_threshold and matched_gt_class == pred_class:
+            # TP 조건: IoU >= threshold (localization 기반)
+            # H1 실험에서는 클래스 일치 없이 localization만으로 TP 판정
+            if max_iou >= self.tp_iou_threshold:
                 detection.is_tp = True
                 detection.matched_gt_idx = int(max_iou_idx)
                 detection.matched_gt_class = matched_gt_class
@@ -225,7 +224,8 @@ class DetectionLogger:
                 # FP: Semantic FP vs Background FP 분류
                 detection.is_tp = False
                 
-                # Semantic FP 판정: 가장 많이 겹치는 GT가 confounder 클래스인 경우
+                # Semantic FP 판정: 
+                # IoU >= semantic_fp_threshold이고 GT가 confounder 클래스인 경우
                 if max_iou >= self.semantic_fp_iou_threshold:
                     if matched_gt_class in self.confounder_indices:
                         detection.triad_label = "Semantic_FP"

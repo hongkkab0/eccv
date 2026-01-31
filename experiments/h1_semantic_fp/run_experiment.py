@@ -227,8 +227,6 @@ def run_detection_phase(config: ExperimentConfig,
         
         # Detection 로깅 - GT와 매칭
         for b, result in enumerate(results):
-            logger.stats["total_images"] += 1
-            
             if result.boxes is None or len(result.boxes) == 0:
                 continue
             
@@ -240,7 +238,9 @@ def run_detection_phase(config: ExperimentConfig,
             # GT 정보 추출 (batch에서)
             batch_mask = batch["batch_idx"] == b
             gt_boxes_norm = batch["bboxes"][batch_mask]  # normalized xywh
-            gt_classes = batch["cls"][batch_mask].squeeze(-1).int()
+            gt_cls_raw = batch["cls"][batch_mask]
+            # cls가 [N, 1] 또는 [N] 형태일 수 있음
+            gt_classes = gt_cls_raw.squeeze(-1).int() if gt_cls_raw.dim() > 1 else gt_cls_raw.int()
             
             # GT boxes를 xyxy로 변환 (이미지 크기 기준)
             img_h, img_w = imgs.shape[2], imgs.shape[3]
@@ -256,6 +256,14 @@ def run_detection_phase(config: ExperimentConfig,
             
             # 이미지 ID
             img_id = f"batch{batch_idx}_img{b}"
+            
+            # 첫 배치에서 디버깅 정보 출력
+            if batch_idx == 0 and b == 0 and verbose:
+                print(f"\n[DEBUG] First batch info:")
+                print(f"  Pred classes (first 5): {pred_classes[:5].tolist()}")
+                print(f"  GT classes (first 5): {gt_classes[:5].tolist() if len(gt_classes) > 0 else []}")
+                print(f"  Pred boxes shape: {pred_boxes.shape}")
+                print(f"  GT boxes shape: {gt_boxes.shape}")
             
             # Logger에 전달
             logger.process_batch(

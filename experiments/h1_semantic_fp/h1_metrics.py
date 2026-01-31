@@ -219,6 +219,14 @@ class H1Evaluator:
                            u_sem_tp: np.ndarray,
                            u_sem_semantic_fp: np.ndarray) -> Dict:
         """ROC curve 데이터 반환 (시각화용)"""
+        # 빈 배열 체크
+        if len(u_sem_tp) == 0 or len(u_sem_semantic_fp) == 0:
+            return {
+                "fpr": np.array([0, 1]),
+                "tpr": np.array([0, 1]),
+                "thresholds": np.array([1, 0]),
+            }
+        
         y_true = np.concatenate([
             np.ones(len(u_sem_semantic_fp)),
             np.zeros(len(u_sem_tp))
@@ -237,6 +245,14 @@ class H1Evaluator:
                           u_sem_tp: np.ndarray,
                           u_sem_semantic_fp: np.ndarray) -> Dict:
         """PR curve 데이터 반환 (시각화용)"""
+        # 빈 배열 체크
+        if len(u_sem_tp) == 0 or len(u_sem_semantic_fp) == 0:
+            return {
+                "precision": np.array([1, 0]),
+                "recall": np.array([0, 1]),
+                "thresholds": np.array([1]),
+            }
+        
         y_true = np.concatenate([
             np.ones(len(u_sem_semantic_fp)),
             np.zeros(len(u_sem_tp))
