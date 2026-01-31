@@ -32,6 +32,9 @@ class Detection:
     pred_class_name: str
     confidence: float
     
+    # 이미지 경로 (CLIP crop embedding 계산용)
+    image_path: Optional[str] = None
+    
     # Region feature (CLIP space)
     region_feature: Optional[np.ndarray] = None  # [embed_dim]
     
@@ -104,6 +107,7 @@ class DetectionLogger:
                       gt_bboxes: torch.Tensor,
                       gt_classes: torch.Tensor,
                       image_ids: List[str],
+                      image_paths: Optional[List[str]] = None,
                       region_features: Optional[torch.Tensor] = None,
                       class_scores: Optional[torch.Tensor] = None):
         """
@@ -114,6 +118,7 @@ class DetectionLogger:
             gt_bboxes: List of [M, 4] per image
             gt_classes: List of [M] per image  
             image_ids: 이미지 ID 리스트
+            image_paths: 이미지 경로 리스트 (CLIP crop embedding용)
             region_features: [B, N, embed_dim] (optional)
             class_scores: [B, N, num_classes] (optional)
         """
@@ -132,6 +137,9 @@ class DetectionLogger:
             # GT
             gt_box = gt_bboxes[b] if isinstance(gt_bboxes, list) else gt_bboxes
             gt_cls = gt_classes[b] if isinstance(gt_classes, list) else gt_classes
+            
+            # 이미지 경로
+            img_path = image_paths[b] if image_paths is not None else None
             
             # Region features (있는 경우)
             reg_feats = region_features[b] if region_features is not None else None
@@ -156,6 +164,7 @@ class DetectionLogger:
                     det_gt_ious=ious[det_idx].cpu().numpy() if ious.numel() > 0 else np.array([]),
                     region_feat=reg_feats[det_idx].cpu().numpy() if reg_feats is not None else None,
                     cls_scores=cls_scores[det_idx].cpu().numpy() if cls_scores is not None else None,
+                    image_path=img_path,
                 )
                 
                 self.detections.append(detection)
@@ -179,7 +188,8 @@ class DetectionLogger:
                                    gt_classes: np.ndarray,
                                    det_gt_ious: np.ndarray,
                                    region_feat: Optional[np.ndarray],
-                                   cls_scores: Optional[np.ndarray]) -> Detection:
+                                   cls_scores: Optional[np.ndarray],
+                                   image_path: Optional[str] = None) -> Detection:
         """단일 detection 처리"""
         
         # Top-K 클래스 추출
@@ -196,6 +206,7 @@ class DetectionLogger:
             pred_class=pred_class,
             pred_class_name=self.class_names.get(pred_class, f"class_{pred_class}"),
             confidence=pred_conf,
+            image_path=image_path,
             region_feature=region_feat,
             top_k_classes=top_k_classes,
             top_k_scores=top_k_scores,

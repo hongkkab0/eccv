@@ -14,9 +14,70 @@ import torch.nn.functional as F
 from typing import List, Dict, Optional, Tuple
 from scipy.special import softmax
 from scipy.stats import entropy
+from PIL import Image
+from pathlib import Path
 
 from .detection_logger import Detection
 from .attribute_embeddings import AttributeEmbeddingCache, get_view_embeddings_for_classes
+
+
+# Global CLIP model cache
+_clip_model = None
+_clip_preprocess = None
+
+
+def get_clip_model(device: str = "cuda"):
+    """CLIP 모델 로드 (캐싱)"""
+    global _clip_model, _clip_preprocess
+    
+    if _clip_model is None:
+        try:
+            import clip
+            _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
+            _clip_model.eval()
+            print(f"  Loaded CLIP ViT-B/32 on {device}")
+        except ImportError:
+            print("  WARNING: clip not installed. Run: pip install git+https://github.com/openai/CLIP.git")
+            return None, None
+    
+    return _clip_model, _clip_preprocess
+
+
+def compute_clip_crop_embedding(image: Image.Image, 
+                                bbox: np.ndarray,
+                                clip_model,
+                                clip_preprocess,
+                                device: str = "cuda") -> np.ndarray:
+    """
+    이미지 crop의 CLIP embedding 계산
+    
+    Args:
+        image: PIL Image
+        bbox: [x1, y1, x2, y2] 좌표
+        clip_model: CLIP 모델
+        clip_preprocess: CLIP 전처리 함수
+        device: 디바이스
+    
+    Returns:
+        [512] embedding vector
+    """
+    # Crop
+    x1, y1, x2, y2 = map(int, bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(image.width, x2), min(image.height, y2)
+    
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(512)
+    
+    crop = image.crop((x1, y1, x2, y2))
+    
+    # CLIP encoding
+    with torch.no_grad():
+        crop_tensor = clip_preprocess(crop).unsqueeze(0).to(device)
+        features = clip_model.encode_image(crop_tensor)
+        features = features / features.norm(dim=-1, keepdim=True)
+    
+    return features.cpu().numpy().squeeze()
 
 
 def js_divergence(distributions: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
@@ -133,18 +194,21 @@ class SemanticUncertaintyCalculator:
                  attribute_cache: AttributeEmbeddingCache,
                  class_names: Dict[int, str],
                  top_m: int = 10,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0,
+                 device: str = "cuda"):
         """
         Args:
             attribute_cache: Attribute embedding 캐시
             class_names: 클래스 이름 딕셔너리
             top_m: Top-M 클래스 게이팅
             temperature: softmax temperature
+            device: 디바이스
         """
         self.attribute_cache = attribute_cache
         self.class_names = class_names
         self.top_m = top_m
         self.temperature = temperature
+        self.device = device
         
         # 전체 클래스의 view embeddings 준비
         self.all_class_indices = sorted(class_names.keys())
@@ -154,6 +218,9 @@ class SemanticUncertaintyCalculator:
         
         # 인덱스 매핑
         self.idx_to_pos = {idx: pos for pos, idx in enumerate(self.all_class_indices)}
+        
+        # CLIP 모델 로드 (crop embedding용)
+        self.clip_model, self.clip_preprocess = get_clip_model(device)
     
     def compute_for_detection(self, detection: Detection, use_gating: bool = True) -> float:
         """
@@ -188,6 +255,32 @@ class SemanticUncertaintyCalculator:
                 self.temperature
             )
     
+    def compute_for_detection_with_image(self, 
+                                          detection: Detection,
+                                          image: Image.Image) -> float:
+        """
+        이미지에서 CLIP crop embedding을 계산하여 u_sem 반환
+        
+        Args:
+            detection: Detection 객체
+            image: PIL Image
+        
+        Returns:
+            u_sem 값
+        """
+        if self.clip_model is None:
+            return 0.0
+        
+        # CLIP crop embedding 계산
+        region_feature = compute_clip_crop_embedding(
+            image, detection.bbox, 
+            self.clip_model, self.clip_preprocess,
+            self.device
+        )
+        
+        # 전체 클래스 대상 u_sem 계산 (게이팅 없이)
+        return compute_u_sem(region_feature, self.view_embeddings, self.temperature)
+    
     def compute_for_detections(self, 
                                detections: List[Detection],
                                use_gating: bool = True) -> np.ndarray:
@@ -200,6 +293,54 @@ class SemanticUncertaintyCalculator:
         u_sems = []
         for det in detections:
             u_sems.append(self.compute_for_detection(det, use_gating))
+        return np.array(u_sems)
+    
+    def compute_for_detections_with_images(self,
+                                            detections: List[Detection],
+                                            image_dir: str,
+                                            show_progress: bool = True) -> np.ndarray:
+        """
+        이미지에서 CLIP crop embedding을 계산하여 u_sem 일괄 반환
+        
+        Args:
+            detections: Detection 리스트
+            image_dir: 이미지 디렉토리
+            show_progress: 진행바 표시
+        
+        Returns:
+            [N] - u_sem 값 배열
+        """
+        from tqdm import tqdm
+        
+        if self.clip_model is None:
+            print("  WARNING: CLIP model not loaded, returning zeros")
+            return np.zeros(len(detections))
+        
+        u_sems = []
+        image_cache = {}  # 이미지 캐싱
+        
+        iterator = tqdm(detections, desc="Computing u_sem") if show_progress else detections
+        
+        for det in iterator:
+            # 이미지 로드 (캐싱)
+            if det.image_path and det.image_path not in image_cache:
+                try:
+                    img_path = Path(image_dir) / det.image_path if not Path(det.image_path).is_absolute() else det.image_path
+                    image_cache[det.image_path] = Image.open(img_path).convert("RGB")
+                except Exception as e:
+                    image_cache[det.image_path] = None
+            
+            image = image_cache.get(det.image_path) if det.image_path else None
+            
+            if image is not None:
+                u_sem = self.compute_for_detection_with_image(det, image)
+            elif det.region_feature is not None:
+                u_sem = self.compute_for_detection(det, use_gating=False)
+            else:
+                u_sem = 0.0
+            
+            u_sems.append(u_sem)
+        
         return np.array(u_sems)
     
     def compute_for_triad_split(self,
@@ -215,6 +356,21 @@ class SemanticUncertaintyCalculator:
             group: self.compute_for_detections(dets, use_gating)
             for group, dets in triad_split.items()
         }
+    
+    def compute_for_triad_split_with_images(self,
+                                             triad_split: Dict[str, List[Detection]],
+                                             image_dir: str) -> Dict[str, np.ndarray]:
+        """
+        이미지에서 CLIP crop embedding을 계산하여 triad split의 u_sem 반환
+        
+        Returns:
+            {"TP": [...], "Semantic_FP": [...], "Background_FP": [...]}
+        """
+        result = {}
+        for group, dets in triad_split.items():
+            print(f"  Computing u_sem for {group} ({len(dets)} samples)...")
+            result[group] = self.compute_for_detections_with_images(dets, image_dir, show_progress=True)
+        return result
 
 
 def compute_paraphrase_disagreement(region_feature: np.ndarray,

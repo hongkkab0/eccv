@@ -225,6 +225,9 @@ def run_detection_phase(config: ExperimentConfig,
         with torch.no_grad():
             results = model.predict(imgs, verbose=False, conf=config.conf_threshold)
         
+        # 이미지 파일 경로 추출
+        im_files = batch.get("im_file", [None] * len(results))
+        
         # Detection 로깅 - GT와 매칭
         for b, result in enumerate(results):
             if result.boxes is None or len(result.boxes) == 0:
@@ -254,16 +257,31 @@ def run_detection_phase(config: ExperimentConfig,
             else:
                 gt_boxes = torch.zeros((0, 4))
             
-            # 이미지 ID
+            # 이미지 ID 및 경로
             img_id = f"batch{batch_idx}_img{b}"
+            img_path = im_files[b] if b < len(im_files) else None
             
-            # 첫 배치에서 디버깅 정보 출력
-            if batch_idx == 0 and b == 0 and verbose:
-                print(f"\n[DEBUG] First batch info:")
-                print(f"  Pred classes (first 5): {pred_classes[:5].tolist()}")
-                print(f"  GT classes (first 5): {gt_classes[:5].tolist() if len(gt_classes) > 0 else []}")
-                print(f"  Pred boxes shape: {pred_boxes.shape}")
-                print(f"  GT boxes shape: {gt_boxes.shape}")
+            # 첫 배치에서 디버깅 정보 출력 (클래스 이름으로)
+            if batch_idx == 0 and b == 0:
+                print(f"\n[DEBUG] First batch sanity check:")
+                print(f"  Image path: {img_path}")
+                print(f"  Pred boxes: {len(pred_boxes)}, GT boxes: {len(gt_boxes)}")
+                
+                # 클래스 이름으로 변환하여 출력
+                pred_cls_list = pred_classes[:5].tolist()
+                gt_cls_list = gt_classes[:5].tolist() if len(gt_classes) > 0 else []
+                
+                pred_names = [class_names.get(c, f"?{c}") for c in pred_cls_list]
+                gt_names = [class_names.get(c, f"?{c}") for c in gt_cls_list]
+                
+                print(f"  Pred classes (first 5): {pred_cls_list} -> {pred_names}")
+                print(f"  GT classes (first 5): {gt_cls_list} -> {gt_names}")
+                
+                # IoU 샘플 출력
+                if len(gt_boxes) > 0 and len(pred_boxes) > 0:
+                    from ultralytics.utils.metrics import box_iou
+                    sample_ious = box_iou(pred_boxes[:3], gt_boxes[:3])
+                    print(f"  Sample IoU (3x3): max={sample_ious.max().item():.3f}")
             
             # Logger에 전달
             logger.process_batch(
@@ -271,6 +289,7 @@ def run_detection_phase(config: ExperimentConfig,
                 gt_bboxes=[gt_boxes],
                 gt_classes=[gt_classes],
                 image_ids=[img_id],
+                image_paths=[img_path],
             )
         
         if verbose and batch_idx % 100 == 0:
@@ -355,15 +374,23 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산
-    print("\n--- Semantic Uncertainty Calculation ---")
+    # 3.3 u_sem 계산 (CLIP crop embedding 사용)
+    print("\n--- Semantic Uncertainty Calculation (CLIP crop) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
         attribute_cache=attribute_cache,
         class_names=class_names,
         top_m=config.top_m_classes,
+        device=config.device,
     )
     
-    u_sem_by_group = u_sem_calculator.compute_for_triad_split(matched_data)
+    # 이미지 디렉토리 (data yaml에서 가져옴)
+    data = check_det_dataset(config.data_yaml)
+    image_dir = Path(data.get("path", "")) / "val2017"  # COCO/LVIS 기본 경로
+    
+    # CLIP crop embedding으로 u_sem 계산
+    u_sem_by_group = u_sem_calculator.compute_for_triad_split_with_images(
+        matched_data, str(image_dir)
+    )
     u_sem_stats = analyze_u_sem_statistics(u_sem_by_group)
     
     print(f"  u_sem statistics:")
@@ -488,9 +515,17 @@ def main():
     print(f"Device: {config.device}")
     print(f"Output: {output_dir}")
     
-    # LVIS 클래스 로드
-    print("\n--- Loading LVIS Classes ---")
-    class_names = load_lvis_class_names()
+    # 클래스 로드 - data yaml에서 직접 가져옴 (인덱스 체계 통일)
+    print("\n--- Loading Classes from Data YAML ---")
+    data = check_det_dataset(config.data_yaml)
+    
+    # data["names"]는 {0: 'name0', 1: 'name1', ...} 또는 ['name0', 'name1', ...] 형태
+    if isinstance(data["names"], dict):
+        class_names = data["names"]
+    else:
+        class_names = {i: name for i, name in enumerate(data["names"])}
+    
+    # Confounder indices도 동일한 인덱스 체계로 구축
     confounder_indices = build_confounder_set(class_names)
     
     print(f"Total classes: {len(class_names)}")
