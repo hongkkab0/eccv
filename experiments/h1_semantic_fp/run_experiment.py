@@ -116,8 +116,8 @@ def get_text_embeddings_with_clip(names: list, device: str = "cuda",
     with torch.no_grad():
         tokens = text_model.tokenize(names)
         txt_feats = text_model.encode_text(tokens)
-        # [1, num_classes, embed_dim] 형태로 변환
-        txt_feats = txt_feats.unsqueeze(0)
+        # [1, num_classes, embed_dim] 형태로 변환, float32로 명시적 변환
+        txt_feats = txt_feats.unsqueeze(0).to(torch.float32)
     
     return txt_feats
 
