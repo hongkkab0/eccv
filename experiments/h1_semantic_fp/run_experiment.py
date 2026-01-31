@@ -350,6 +350,11 @@ def run_evaluation_phase(config: ExperimentConfig,
     print(f"    Max mean difference: {verification['max_mean_difference']:.4f}")
     print(f"    Well matched: {verification['is_well_matched']}")
     
+    # Matching 실패 시 원본 데이터 사용 (fallback)
+    if verification['total_samples'] == 0:
+        print("  WARNING: Confidence matching failed. Using unmatched data.")
+        matched_data = triad_split
+    
     # 3.3 u_sem 계산
     print("\n--- Semantic Uncertainty Calculation ---")
     u_sem_calculator = SemanticUncertaintyCalculator(

@@ -121,10 +121,14 @@ def plot_u_sem_distribution(u_sem_data: Dict[str, np.ndarray],
             box_labels.append(group.replace("_", " "))
             box_colors.append(colors[group])
     
-    bp = ax2.boxplot(box_data, labels=box_labels, patch_artist=True)
-    for patch, color in zip(bp['boxes'], box_colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.6)
+    # 데이터가 없으면 빈 boxplot 스킵
+    if len(box_data) > 0:
+        bp = ax2.boxplot(box_data, labels=box_labels, patch_artist=True)
+        for patch, color in zip(bp['boxes'], box_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.6)
+    else:
+        ax2.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax2.transAxes)
     
     ax2.set_ylabel("$u_{sem}$")
     ax2.set_title("$u_{sem}$ by Detection Type")

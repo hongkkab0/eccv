@@ -212,9 +212,8 @@ class DetectionLogger:
             max_iou = det_gt_ious[max_iou_idx]
             matched_gt_class = int(gt_classes[max_iou_idx])
             
-            # TP 조건: IoU >= threshold (localization 기반)
-            # H1 실험에서는 클래스 일치 없이 localization만으로 TP 판정
-            if max_iou >= self.tp_iou_threshold:
+            # TP 조건: IoU >= threshold AND 클래스 일치
+            if max_iou >= self.tp_iou_threshold and matched_gt_class == pred_class:
                 detection.is_tp = True
                 detection.matched_gt_idx = int(max_iou_idx)
                 detection.matched_gt_class = matched_gt_class
@@ -224,10 +223,15 @@ class DetectionLogger:
                 # FP: Semantic FP vs Background FP 분류
                 detection.is_tp = False
                 
-                # Semantic FP 판정: 
-                # IoU >= semantic_fp_threshold이고 GT가 confounder 클래스인 경우
+                # Semantic FP 판정 (확장된 정의):
+                # 1) IoU >= semantic_fp_threshold이고 클래스가 다른 경우 (classification error)
+                # 2) 또는 GT가 confounder 클래스인 경우
                 if max_iou >= self.semantic_fp_iou_threshold:
-                    if matched_gt_class in self.confounder_indices:
+                    # 클래스가 다르면 Semantic FP (localization OK, classification WRONG)
+                    is_class_mismatch = (matched_gt_class != pred_class)
+                    is_gt_confounder = matched_gt_class in self.confounder_indices
+                    
+                    if is_class_mismatch or is_gt_confounder:
                         detection.triad_label = "Semantic_FP"
                         detection.overlapping_gt_idx = int(max_iou_idx)
                         detection.overlapping_gt_class = matched_gt_class
