@@ -153,7 +153,7 @@ def run_detection_phase(config: ExperimentConfig,
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
-    # cfg 객체 생성 (build_yolo_dataset에 필요)
+    # cfg 객체 생성 (build_yolo_dataset에 필요한 모든 속성)
     from types import SimpleNamespace
     dataset_cfg = SimpleNamespace(
         imgsz=config.imgsz,
@@ -164,6 +164,27 @@ def run_detection_phase(config: ExperimentConfig,
         classes=None,
         fraction=1.0,
         load_vp=False,
+        # augmentation 관련 (validation이므로 비활성화)
+        mosaic=0.0,
+        mixup=0.0,
+        copy_paste=0.0,
+        # mask 관련
+        mask_ratio=4,
+        overlap_mask=False,
+        # 기타
+        bgr=0.0,
+        degrees=0.0,
+        translate=0.0,
+        scale=0.0,
+        shear=0.0,
+        perspective=0.0,
+        flipud=0.0,
+        fliplr=0.0,
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.0,
+        erasing=0.0,
+        crop_fraction=1.0,
     )
     
     dataset = build_yolo_dataset(
