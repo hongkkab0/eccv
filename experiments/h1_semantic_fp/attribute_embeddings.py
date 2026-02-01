@@ -40,7 +40,7 @@ class AttributeEmbeddingCache:
     # 메타데이터
     num_views: int = 5
     embed_dim: int = 512
-    text_model: str = "clip:ViT-B/32"
+    text_model: str = "mobileclip:blt"
 
 
 class AttributeEmbeddingGenerator:
@@ -101,7 +101,7 @@ class AttributeEmbeddingGenerator:
     ]
     
     def __init__(self, 
-                 text_model_name: str = "clip:ViT-B/32",
+                 text_model_name: str = "mobileclip:blt",
                  device: str = "cuda",
                  num_views: int = 5):
         """

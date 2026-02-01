@@ -75,8 +75,8 @@ def parse_args():
                         help="Top-M classes for gating")
     parser.add_argument("--num-views", type=int, default=5,
                         help="Number of attribute views (K)")
-    parser.add_argument("--text-model", type=str, default="clip:ViT-B/32",
-                        help="Text model for embeddings (default: clip:ViT-B/32)")
+    parser.add_argument("--text-model", type=str, default="mobileclip:blt",
+                        help="Text model for embeddings (default: mobileclip:blt)")
     
     # 단계별 실행
     parser.add_argument("--skip-detection", action="store_true",
