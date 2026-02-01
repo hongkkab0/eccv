@@ -16,7 +16,7 @@ class ExperimentConfig:
     # === A-1: 데이터셋/추론 세팅 ===
     dataset: str = "lvis"  # LVIS v1 val
     data_yaml: str = "lvis.yaml"
-    split: str = "val"  # val 전체
+    split: str = "minival"  # minival (5000 images) - val 전체는 19809개
     
     # Detector 설정
     checkpoint: str = "yoloe-v8l-seg.pt"  # YOLO-E checkpoint

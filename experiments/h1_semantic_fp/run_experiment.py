@@ -188,9 +188,14 @@ def run_detection_phase(config: ExperimentConfig,
         crop_fraction=1.0,
     )
     
+    # split 선택: minival (5000) vs val (19809)
+    split_key = config.split if config.split in data else 'val'
+    split_path = data.get(split_key)
+    print(f"  Using split: {split_key} -> {split_path}")
+    
     dataset = build_yolo_dataset(
         dataset_cfg,
-        data.get('val'),
+        split_path,
         batch=config.batch_size,
         data=data,
         mode='val',
