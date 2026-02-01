@@ -230,6 +230,11 @@ def run_detection_phase(config: ExperimentConfig,
     total_gts = 0
     debug_printed = False  # 디버깅 출력 여부
     
+    # 클래스 분포 분석 (IoU > 0.5인 쌍)
+    pred_class_counts = {}  # 모델이 예측한 클래스 분포
+    gt_class_counts = {}    # GT 클래스 분포
+    mismatch_examples = []  # 불일치 예시 수집
+    
     for batch_idx, batch in enumerate(tqdm(dataloader, total=total_images)):
         if max_images and batch_idx >= max_images:
             break
@@ -304,8 +309,21 @@ def run_detection_phase(config: ExperimentConfig,
                 for p_idx in range(len(pred_boxes)):
                     max_iou, max_gt_idx = ious[p_idx].max(dim=0)
                     if max_iou > 0.5:
-                        if pred_classes[p_idx].item() == gt_classes[max_gt_idx].item():
+                        p_cls = pred_classes[p_idx].item()
+                        g_cls = gt_classes[max_gt_idx].item()
+                        
+                        # 클래스 분포 수집
+                        pred_class_counts[p_cls] = pred_class_counts.get(p_cls, 0) + 1
+                        gt_class_counts[g_cls] = gt_class_counts.get(g_cls, 0) + 1
+                        
+                        if p_cls == g_cls:
                             tp_class_count += 1
+                        else:
+                            # 불일치 예시 수집 (최대 100개)
+                            if len(mismatch_examples) < 100:
+                                p_name = class_names.get(p_cls, f"?{p_cls}")
+                                g_name = class_names.get(g_cls, f"?{g_cls}")
+                                mismatch_examples.append(f"pred[{p_cls}]={p_name} vs GT[{g_cls}]={g_name}")
             
             # 첫 번째로 GT와 pred가 모두 있는 이미지에서 디버깅 출력
             if not debug_printed and len(gt_boxes) > 0 and len(pred_boxes) > 0:
@@ -372,6 +390,33 @@ def run_detection_phase(config: ExperimentConfig,
     print(f"  TP_class (IoU>0.5 + class match): {tp_class_count}")
     print(f"  -> If TP_any >> TP_class: Class mapping is broken (A/B)")
     print(f"  -> If TP_any is also low: IoU/coordinate issue (C)")
+    
+    # 클래스 분포 분석 출력
+    print(f"\n[DIAGNOSIS] Class Distribution (IoU>0.5 pairs):")
+    print(f"  Unique pred classes: {len(pred_class_counts)}")
+    print(f"  Unique GT classes: {len(gt_class_counts)}")
+    
+    # 가장 많이 예측된 클래스 Top 10
+    if pred_class_counts:
+        top_pred = sorted(pred_class_counts.items(), key=lambda x: -x[1])[:10]
+        print(f"  Top 10 predicted classes:")
+        for cls_id, cnt in top_pred:
+            cls_name = class_names.get(cls_id, f"?{cls_id}")
+            print(f"    [{cls_id}] {cls_name}: {cnt}")
+    
+    # 가장 많은 GT 클래스 Top 10
+    if gt_class_counts:
+        top_gt = sorted(gt_class_counts.items(), key=lambda x: -x[1])[:10]
+        print(f"  Top 10 GT classes:")
+        for cls_id, cnt in top_gt:
+            cls_name = class_names.get(cls_id, f"?{cls_id}")
+            print(f"    [{cls_id}] {cls_name}: {cnt}")
+    
+    # 불일치 예시 출력
+    if mismatch_examples:
+        print(f"\n[DIAGNOSIS] Mismatch examples (first 20 of {len(mismatch_examples)}):")
+        for ex in mismatch_examples[:20]:
+            print(f"    {ex}")
     
     return logger
 
