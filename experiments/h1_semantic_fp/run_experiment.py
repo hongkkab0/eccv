@@ -302,22 +302,30 @@ def run_detection_phase(config: ExperimentConfig,
                 print(f"  Image path: {img_path}")
                 print(f"  Pred boxes: {len(pred_boxes)}, GT boxes: {len(gt_boxes)}")
                 
-                # 클래스 이름으로 변환하여 출력
-                pred_cls_list = pred_classes[:10].tolist()
-                gt_cls_list = gt_classes[:10].tolist() if len(gt_classes) > 0 else []
-                
-                pred_names = [class_names.get(c, f"?{c}") for c in pred_cls_list]
-                gt_names = [class_names.get(c, f"?{c}") for c in gt_cls_list]
-                
-                print(f"  Pred classes (first 10): {pred_cls_list}")
-                print(f"  Pred names: {pred_names}")
-                print(f"  GT classes (first 10): {gt_cls_list}")
-                print(f"  GT names: {gt_names}")
-                
-                # IoU 샘플 출력
+                # IoU가 높은 pred-GT 쌍 찾아서 클래스 비교 (핵심 디버깅)
                 if len(gt_boxes) > 0 and len(pred_boxes) > 0:
-                    sample_ious = box_iou(pred_boxes[:5], gt_boxes[:5])
-                    print(f"  Sample IoU (5x5): max={sample_ious.max().item():.3f}, mean={sample_ious.mean().item():.3f}")
+                    ious_debug = box_iou(pred_boxes, gt_boxes)
+                    print(f"\n  [CLASS MAPPING DEBUG] High-IoU pairs:")
+                    
+                    # IoU > 0.5인 쌍 찾기
+                    high_iou_pairs = []
+                    for p_idx in range(min(len(pred_boxes), 20)):
+                        max_iou, max_gt_idx = ious_debug[p_idx].max(dim=0)
+                        if max_iou > 0.5:
+                            p_cls = pred_classes[p_idx].item()
+                            g_cls = gt_classes[max_gt_idx].item()
+                            p_name = class_names.get(p_cls, f"?{p_cls}")
+                            g_name = class_names.get(g_cls, f"?{g_cls}")
+                            match = "✓" if p_cls == g_cls else "✗"
+                            high_iou_pairs.append(f"    IoU={max_iou:.2f}: pred[{p_cls}]={p_name} vs GT[{g_cls}]={g_name} {match}")
+                    
+                    if high_iou_pairs:
+                        for pair in high_iou_pairs[:10]:
+                            print(pair)
+                    else:
+                        print("    No high-IoU pairs found!")
+                    
+                    print(f"\n  Sample IoU (5x5): max={ious_debug[:5,:5].max().item():.3f}")
             
             # Logger에 전달
             logger.process_batch(
