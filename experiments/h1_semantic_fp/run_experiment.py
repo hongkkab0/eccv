@@ -101,29 +101,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_text_embeddings_with_clip(names: list, device: str = "cuda", 
-                                   text_model_name: str = "clip:ViT-B/32") -> torch.Tensor:
+def get_text_embeddings_with_model(model: YOLOE, names: list, text_model_name: str = "clip:ViT-B/32") -> torch.Tensor:
     """
-    CLIP을 사용하여 텍스트 임베딩 생성 (MobileCLIP 의존성 제거)
+    YOLOE 모델의 get_text_pe()를 사용하여 텍스트 임베딩 생성
+    
+    중요: 단순 CLIP 임베딩이 아니라 head.get_tpe()를 거쳐야 올바른 형식이 됨
     
     Args:
-        names: 클래스 이름 리스트
-        device: 디바이스
-        text_model_name: 텍스트 모델 이름 (default: clip:ViT-B/32)
+        model: YOLOE 모델
+        names: 클래스 이름 리스트  
+        text_model_name: 텍스트 모델 이름 (clip:ViT-B/32 권장)
     """
-    from ultralytics.nn.text_model import build_text_model
-    
     print(f"  Building text embeddings for {len(names)} classes using {text_model_name}...")
-    text_model = build_text_model(text_model_name, device=device)
-    text_model.eval()
     
-    with torch.no_grad():
-        tokens = text_model.tokenize(names)
-        txt_feats = text_model.encode_text(tokens)
-        # [1, num_classes, embed_dim] 형태로 변환, float32로 명시적 변환
-        txt_feats = txt_feats.unsqueeze(0).to(torch.float32)
+    # 모델의 text_model 설정을 변경 (MobileCLIP -> CLIP)
+    if hasattr(model.model, 'args'):
+        model.model.args["text_model"] = text_model_name
     
-    return txt_feats
+    # 모델의 get_text_pe() 사용 - head.get_tpe()를 포함하여 올바른 형식 반환
+    tpe = model.get_text_pe(names)
+    
+    return tpe
 
 
 def run_detection_phase(config: ExperimentConfig,
@@ -155,7 +153,7 @@ def run_detection_phase(config: ExperimentConfig,
     # 모델 설정 - data yaml 기준 이름 순서 사용
     names = [class_names[i] for i in range(len(class_names))]
     names = [name.split("/")[0] for name in names]
-    tpe = get_text_embeddings_with_clip(names, device=config.device, text_model_name=config.text_model)
+    tpe = get_text_embeddings_with_model(model, names, text_model_name=config.text_model)
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
