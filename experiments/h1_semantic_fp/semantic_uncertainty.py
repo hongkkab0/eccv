@@ -21,32 +21,109 @@ from .detection_logger import Detection
 from .attribute_embeddings import AttributeEmbeddingCache, get_view_embeddings_for_classes
 
 
-# Global CLIP model cache
-_clip_model = None
-_clip_preprocess = None
-
-
-def get_clip_model(device: str = "cuda"):
-    """CLIP 모델 로드 (캐싱)"""
-    global _clip_model, _clip_preprocess
+class YOLOEFeatureExtractor:
+    """
+    YOLOE에서 detection 시 visual feature를 추출하는 클래스
+    cv3 (visual embedding) 레이어의 output을 hook으로 캡처
+    """
     
-    if _clip_model is None:
-        try:
-            import clip
-            _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
-            _clip_model.eval()
-            print(f"  Loaded CLIP ViT-B/32 on {device}")
-        except ImportError:
-            print("  WARNING: clip not installed. Run: pip install git+https://github.com/openai/CLIP.git")
-            return None, None
+    def __init__(self, model, device: str = "cuda"):
+        """
+        Args:
+            model: YOLOE 모델
+            device: 디바이스
+        """
+        self.model = model
+        self.device = device
+        self.cv3_features = []  # 각 scale의 cv3 output 저장
+        self.hooks = []
+        self._register_hooks()
     
-    return _clip_model, _clip_preprocess
+    def _register_hooks(self):
+        """cv3 레이어에 hook 등록"""
+        head = self.model.model.model[-1]  # YOLOEDetect or YOLOESegment
+        
+        for i, cv3_module in enumerate(head.cv3):
+            hook = cv3_module.register_forward_hook(
+                lambda module, inp, out, idx=i: self._save_cv3_output(idx, out)
+            )
+            self.hooks.append(hook)
+    
+    def _save_cv3_output(self, idx: int, output: torch.Tensor):
+        """cv3 output 저장"""
+        # output: [B, embed_dim, H, W]
+        if len(self.cv3_features) <= idx:
+            self.cv3_features.append(output.detach())
+        else:
+            self.cv3_features[idx] = output.detach()
+    
+    def clear(self):
+        """저장된 feature 초기화"""
+        self.cv3_features = []
+    
+    def remove_hooks(self):
+        """Hook 제거"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+    
+    def extract_features_for_boxes(self, 
+                                    boxes: torch.Tensor,
+                                    strides: torch.Tensor) -> torch.Tensor:
+        """
+        Detection boxes에 대한 visual feature 추출
+        
+        Args:
+            boxes: [N, 4] xyxy 좌표
+            strides: [N] 각 detection의 stride (어느 scale에서 왔는지)
+        
+        Returns:
+            [N, embed_dim] visual features
+        """
+        if len(self.cv3_features) == 0:
+            return None
+        
+        features = []
+        head = self.model.model.model[-1]
+        head_strides = head.stride  # 각 scale의 stride
+        
+        for i, (box, stride) in enumerate(zip(boxes, strides)):
+            # 해당 stride의 scale index 찾기
+            scale_idx = (head_strides == stride).nonzero(as_tuple=True)[0]
+            if len(scale_idx) == 0:
+                scale_idx = 0
+            else:
+                scale_idx = scale_idx[0].item()
+            
+            # 해당 scale의 feature map
+            feat_map = self.cv3_features[scale_idx]  # [B, embed_dim, H, W]
+            
+            # box 중심점의 feature map 위치
+            cx = (box[0] + box[2]) / 2
+            cy = (box[1] + box[3]) / 2
+            
+            # stride로 나눠서 feature map 좌표로 변환
+            fx = int(cx / stride.item())
+            fy = int(cy / stride.item())
+            
+            # 범위 체크
+            _, _, H, W = feat_map.shape
+            fx = min(max(fx, 0), W - 1)
+            fy = min(max(fy, 0), H - 1)
+            
+            # feature 추출 (batch=0 가정)
+            feat = feat_map[0, :, fy, fx]  # [embed_dim]
+            features.append(feat)
+        
+        if len(features) == 0:
+            return None
+        
+        return torch.stack(features)  # [N, embed_dim]
 
 
-def compute_clip_crop_embedding(image: Image.Image, 
+def compute_yoloe_crop_embedding(image: Image.Image, 
                                 bbox: np.ndarray,
-                                clip_model,
-                                clip_preprocess,
+                                model,
                                 device: str = "cuda") -> np.ndarray:
     """
     이미지 crop의 CLIP embedding 계산
@@ -219,8 +296,9 @@ class SemanticUncertaintyCalculator:
         # 인덱스 매핑
         self.idx_to_pos = {idx: pos for pos, idx in enumerate(self.all_class_indices)}
         
-        # CLIP 모델 로드 (crop embedding용)
-        self.clip_model, self.clip_preprocess = get_clip_model(device)
+        # YOLOE visual feature 사용 (CLIP은 더 이상 필요없음)
+        self.clip_model = None
+        self.clip_preprocess = None
     
     def compute_for_detection(self, detection: Detection, use_gating: bool = True) -> float:
         """
