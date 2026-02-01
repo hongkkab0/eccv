@@ -218,6 +218,12 @@ def run_detection_phase(config: ExperimentConfig,
     
     print(f"Processing {total_images} images...")
     
+    # 진단용 카운터
+    tp_any_count = 0  # IoU만으로 TP (클래스 무시)
+    tp_class_count = 0  # IoU + 클래스 일치 TP
+    total_preds = 0
+    total_gts = 0
+    
     for batch_idx, batch in enumerate(tqdm(dataloader, total=total_images)):
         if max_images and batch_idx >= max_images:
             break
@@ -268,6 +274,24 @@ def run_detection_phase(config: ExperimentConfig,
             img_id = f"batch{batch_idx}_img{b}"
             img_path = im_files[b] if b < len(im_files) else None
             
+            # 진단: TP_any (IoU만) vs TP_class (IoU + 클래스)
+            total_preds += len(pred_boxes)
+            total_gts += len(gt_classes)
+            
+            if len(gt_boxes) > 0 and len(pred_boxes) > 0:
+                from ultralytics.utils.metrics import box_iou
+                ious = box_iou(pred_boxes, gt_boxes)  # [Np, Ng]
+                
+                # TP_any: IoU > 0.5인 pred가 있으면 카운트 (클래스 무시)
+                tp_any_count += (ious.max(dim=1).values > 0.5).sum().item()
+                
+                # TP_class: IoU > 0.5 AND 클래스 일치
+                for p_idx in range(len(pred_boxes)):
+                    max_iou, max_gt_idx = ious[p_idx].max(dim=0)
+                    if max_iou > 0.5:
+                        if pred_classes[p_idx].item() == gt_classes[max_gt_idx].item():
+                            tp_class_count += 1
+            
             # 첫 배치에서 디버깅 정보 출력 (클래스 이름으로)
             if batch_idx == 0 and b == 0:
                 print(f"\n[DEBUG] First batch sanity check:")
@@ -275,20 +299,21 @@ def run_detection_phase(config: ExperimentConfig,
                 print(f"  Pred boxes: {len(pred_boxes)}, GT boxes: {len(gt_boxes)}")
                 
                 # 클래스 이름으로 변환하여 출력
-                pred_cls_list = pred_classes[:5].tolist()
-                gt_cls_list = gt_classes[:5].tolist() if len(gt_classes) > 0 else []
+                pred_cls_list = pred_classes[:10].tolist()
+                gt_cls_list = gt_classes[:10].tolist() if len(gt_classes) > 0 else []
                 
                 pred_names = [class_names.get(c, f"?{c}") for c in pred_cls_list]
                 gt_names = [class_names.get(c, f"?{c}") for c in gt_cls_list]
                 
-                print(f"  Pred classes (first 5): {pred_cls_list} -> {pred_names}")
-                print(f"  GT classes (first 5): {gt_cls_list} -> {gt_names}")
+                print(f"  Pred classes (first 10): {pred_cls_list}")
+                print(f"  Pred names: {pred_names}")
+                print(f"  GT classes (first 10): {gt_cls_list}")
+                print(f"  GT names: {gt_names}")
                 
                 # IoU 샘플 출력
                 if len(gt_boxes) > 0 and len(pred_boxes) > 0:
-                    from ultralytics.utils.metrics import box_iou
-                    sample_ious = box_iou(pred_boxes[:3], gt_boxes[:3])
-                    print(f"  Sample IoU (3x3): max={sample_ious.max().item():.3f}")
+                    sample_ious = box_iou(pred_boxes[:5], gt_boxes[:5])
+                    print(f"  Sample IoU (5x5): max={sample_ious.max().item():.3f}, mean={sample_ious.mean().item():.3f}")
             
             # Logger에 전달
             logger.process_batch(
@@ -304,6 +329,15 @@ def run_detection_phase(config: ExperimentConfig,
     
     print(f"\nDetection complete!")
     print(f"Stats: {logger.get_stats()}")
+    
+    # 진단 결과 출력
+    print(f"\n[DIAGNOSIS] TP Analysis:")
+    print(f"  Total predictions: {total_preds}")
+    print(f"  Total GT boxes: {total_gts}")
+    print(f"  TP_any (IoU>0.5, class ignored): {tp_any_count}")
+    print(f"  TP_class (IoU>0.5 + class match): {tp_class_count}")
+    print(f"  -> If TP_any >> TP_class: Class mapping is broken (A/B)")
+    print(f"  -> If TP_any is also low: IoU/coordinate issue (C)")
     
     return logger
 
