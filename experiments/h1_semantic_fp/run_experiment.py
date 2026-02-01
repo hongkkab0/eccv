@@ -101,24 +101,22 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_text_embeddings_with_model(model: YOLOE, names: list, text_model_name: str = "clip:ViT-B/32") -> torch.Tensor:
+def get_text_embeddings_with_model(model: YOLOE, names: list) -> torch.Tensor:
     """
     YOLOE 모델의 get_text_pe()를 사용하여 텍스트 임베딩 생성
     
-    중요: 단순 CLIP 임베딩이 아니라 head.get_tpe()를 거쳐야 올바른 형식이 됨
+    중요: 
+    - YOLOE는 MobileCLIP으로 훈련됨 → MobileCLIP 사용 필수
+    - head.get_tpe()를 거쳐야 올바른 형식이 됨
+    - mobileclip_blt.pt 파일이 현재 디렉토리에 있어야 함
     
     Args:
         model: YOLOE 모델
         names: 클래스 이름 리스트  
-        text_model_name: 텍스트 모델 이름 (clip:ViT-B/32 권장)
     """
-    print(f"  Building text embeddings for {len(names)} classes using {text_model_name}...")
+    print(f"  Building text embeddings for {len(names)} classes using MobileCLIP (model default)...")
     
-    # 모델의 text_model 설정을 변경 (MobileCLIP -> CLIP)
-    if hasattr(model.model, 'args'):
-        model.model.args["text_model"] = text_model_name
-    
-    # 모델의 get_text_pe() 사용 - head.get_tpe()를 포함하여 올바른 형식 반환
+    # 모델의 get_text_pe() 사용 - MobileCLIP + head.get_tpe()
     tpe = model.get_text_pe(names)
     
     return tpe
@@ -153,7 +151,7 @@ def run_detection_phase(config: ExperimentConfig,
     # 모델 설정 - data yaml 기준 이름 순서 사용
     names = [class_names[i] for i in range(len(class_names))]
     names = [name.split("/")[0] for name in names]
-    tpe = get_text_embeddings_with_model(model, names, text_model_name=config.text_model)
+    tpe = get_text_embeddings_with_model(model, names)  # MobileCLIP 사용 (모델 기본값)
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
