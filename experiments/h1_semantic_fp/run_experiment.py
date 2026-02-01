@@ -148,13 +148,13 @@ def run_detection_phase(config: ExperimentConfig,
         top_k=config.top_m_classes,
     )
     
-    # 모델 설정 - YOLOE는 이미 LVIS로 훈련되었으므로 set_classes() 없이 사용
-    # 모델의 내부 names를 확인하고, 필요시 data.yaml의 names로 덮어쓰기
-    print(f"  Model default names count: {len(model.names) if model.names else 'None'}")
-    
-    # data.yaml의 names로 모델 names 설정 (클래스 이름만 설정, 임베딩은 그대로)
-    names_list = [class_names[i] for i in range(len(class_names))]
-    model.names = {i: name for i, name in enumerate(names_list)}
+    # 모델 설정 - 공식 YOLOE 방식: model.get_text_pe() 사용
+    # MobileCLIP 체크포인트 (mobileclip_blt.pt)가 현재 디렉토리에 필요함
+    names = [class_names[i] for i in range(len(class_names))]
+    names = [name.split("/")[0] for name in names]  # 슬래시 앞부분만 사용
+    print(f"  Building text embeddings for {len(names)} classes...")
+    tpe = model.get_text_pe(names)
+    model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
     # cfg 객체 생성 (build_yolo_dataset에 필요한 모든 속성)
