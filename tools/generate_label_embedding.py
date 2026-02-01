@@ -46,25 +46,47 @@ def collect_detection_labels(yaml_path):
     return cat_names
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lvis', action='store_true', help='Generate LVIS label embeddings only')
+    args = parser.parse_args()
+    
     os.environ["PYTHONHASHSEED"] = "0"
-    
-    flickr_cache = '../datasets/flickr/annotations/final_flickr_separateGT_train_segm.cache'
-    mixed_grounding_cache = '../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.cache'
-    objects365v1_yaml = 'ultralytics/cfg/datasets/Objects365v1.yaml'
-    
-    all_cat_names = set()
-    all_cat_names |= collect_detection_labels(objects365v1_yaml)
-    all_cat_names |= collect_grounding_labels(flickr_cache)
-    all_cat_names |= collect_grounding_labels(mixed_grounding_cache)
-    
-    all_cat_names = list(all_cat_names)
-    
     model = yaml_load('ultralytics/cfg/default.yaml')['text_model']
-    all_cat_feats = generate_label_embedding(model, all_cat_names)
     
-    cat_name_feat_map = {}
-    for name, feat in zip(all_cat_names, all_cat_feats):
-        cat_name_feat_map[name] = feat
-    
-    os.makedirs(f'tools/{model}', exist_ok=True)
-    torch.save(cat_name_feat_map, f'tools/{model}/train_label_embeddings.pt')
+    if args.lvis:
+        # LVIS 임베딩만 생성
+        lvis_yaml = 'ultralytics/cfg/datasets/lvis.yaml'
+        all_cat_names = list(collect_detection_labels(lvis_yaml))
+        print(f"Generating embeddings for {len(all_cat_names)} LVIS classes...")
+        
+        all_cat_feats = generate_label_embedding(model, all_cat_names)
+        
+        cat_name_feat_map = {}
+        for name, feat in zip(all_cat_names, all_cat_feats):
+            cat_name_feat_map[name] = feat
+        
+        os.makedirs(f'tools/{model}', exist_ok=True)
+        torch.save(cat_name_feat_map, f'tools/{model}/lvis_label_embeddings.pt')
+        print(f"Saved to tools/{model}/lvis_label_embeddings.pt")
+    else:
+        # 기존 로직 (train용)
+        flickr_cache = '../datasets/flickr/annotations/final_flickr_separateGT_train_segm.cache'
+        mixed_grounding_cache = '../datasets/mixed_grounding/annotations/final_mixed_train_no_coco_segm.cache'
+        objects365v1_yaml = 'ultralytics/cfg/datasets/Objects365v1.yaml'
+        
+        all_cat_names = set()
+        all_cat_names |= collect_detection_labels(objects365v1_yaml)
+        all_cat_names |= collect_grounding_labels(flickr_cache)
+        all_cat_names |= collect_grounding_labels(mixed_grounding_cache)
+        
+        all_cat_names = list(all_cat_names)
+        
+        all_cat_feats = generate_label_embedding(model, all_cat_names)
+        
+        cat_name_feat_map = {}
+        for name, feat in zip(all_cat_names, all_cat_feats):
+            cat_name_feat_map[name] = feat
+        
+        os.makedirs(f'tools/{model}', exist_ok=True)
+        torch.save(cat_name_feat_map, f'tools/{model}/train_label_embeddings.pt')
