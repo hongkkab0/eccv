@@ -66,9 +66,12 @@ if __name__ == '__main__':
         for name, feat in zip(all_cat_names, all_cat_feats):
             cat_name_feat_map[name] = feat
         
-        os.makedirs(f'tools/{model}', exist_ok=True)
-        torch.save(cat_name_feat_map, f'tools/{model}/lvis_label_embeddings.pt')
-        print(f"Saved to tools/{model}/lvis_label_embeddings.pt")
+        # 저장 경로: tools/mobileclip_blt/ (콜론을 언더스코어로)
+        save_dir = f'tools/{model.replace(":", "_")}'
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = f'{save_dir}/lvis_label_embeddings.pt'
+        torch.save(cat_name_feat_map, save_path)
+        print(f"Saved to {save_path}")
     else:
         # 기존 로직 (train용)
         flickr_cache = '../datasets/flickr/annotations/final_flickr_separateGT_train_segm.cache'

@@ -127,11 +127,32 @@ def run_detection_phase(config: ExperimentConfig,
         top_k=config.top_m_classes,
     )
     
-    # 모델 설정 - 공식 YOLOE 방식 (mobileclip_blt.pt 필요)
+    # 모델 설정 - 라벨 임베딩 로드 (tools/mobileclip_blt/lvis_label_embeddings.pt)
     names = [class_names[i] for i in range(len(class_names))]
     names = [name.split("/")[0] for name in names]  # 슬래시 앞부분만 사용
-    print(f"  Building text embeddings for {len(names)} classes...")
-    tpe = model.get_text_pe(names)
+    
+    label_emb_path = Path("tools/mobileclip_blt/lvis_label_embeddings.pt")
+    if label_emb_path.exists():
+        print(f"  Loading label embeddings from {label_emb_path}...")
+        label_embeddings = torch.load(label_emb_path, map_location=config.device)
+        
+        # names 순서대로 임베딩 추출
+        txt_feats_list = []
+        for name in names:
+            if name in label_embeddings:
+                txt_feats_list.append(label_embeddings[name])
+            else:
+                print(f"  WARNING: '{name}' not found in label embeddings")
+                txt_feats_list.append(torch.zeros_like(next(iter(label_embeddings.values()))))
+        
+        txt_feats = torch.stack(txt_feats_list).unsqueeze(0).to(config.device)
+        tpe = model.model.model[-1].get_tpe(txt_feats)  # head.get_tpe() 적용
+    else:
+        print(f"  Label embeddings not found at {label_emb_path}")
+        print(f"  Run: python tools/generate_label_embedding.py --lvis")
+        print(f"  Building with model.get_text_pe() (requires mobileclip_blt.pt)...")
+        tpe = model.get_text_pe(names)
+    
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
