@@ -14,9 +14,11 @@ class ExperimentConfig:
     """실험 전체 설정"""
     
     # === A-1: 데이터셋/추론 세팅 ===
-    dataset: str = "lvis"  # LVIS v1 val
-    data_yaml: str = "lvis.yaml"
-    split: str = "minival"  # minival (5000 images) - val 전체는 19809개
+    # COCO로 먼저 파이프라인 검증 (80 classes, 라벨 확실히 있음)
+    # LVIS는 라벨 경로 문제 해결 후 사용
+    dataset: str = "coco"
+    data_yaml: str = "coco.yaml"
+    split: str = "val"  # COCO val2017 (5000 images)
     
     # Detector 설정
     checkpoint: str = "yoloe-v8l-seg.pt"  # YOLO-E checkpoint
