@@ -130,6 +130,7 @@ def run_detection_phase(config: ExperimentConfig,
                         model: YOLOE,
                         class_names: dict,
                         confounder_indices: set,
+                        gt_to_model_idx: dict = None,
                         max_images: int = None,
                         verbose: bool = False) -> DetectionLogger:
     """
@@ -261,7 +262,16 @@ def run_detection_phase(config: ExperimentConfig,
             gt_boxes_norm = batch["bboxes"][batch_mask]  # normalized xywh
             gt_cls_raw = batch["cls"][batch_mask]
             # cls가 [N, 1] 또는 [N] 형태일 수 있음
-            gt_classes = gt_cls_raw.squeeze(-1).int() if gt_cls_raw.dim() > 1 else gt_cls_raw.int()
+            gt_classes_orig = gt_cls_raw.squeeze(-1).int() if gt_cls_raw.dim() > 1 else gt_cls_raw.int()
+            
+            # GT 인덱스를 모델 인덱스로 변환 (라벨 파일 ↔ data.yaml 순서 불일치 해결)
+            if gt_to_model_idx is not None and len(gt_classes_orig) > 0:
+                gt_classes = torch.tensor(
+                    [gt_to_model_idx.get(c.item(), c.item()) for c in gt_classes_orig],
+                    dtype=torch.int
+                )
+            else:
+                gt_classes = gt_classes_orig
             
             # GT boxes를 xyxy로 변환 (이미지 크기 기준)
             img_h, img_w = imgs.shape[2], imgs.shape[3]
@@ -304,21 +314,31 @@ def run_detection_phase(config: ExperimentConfig,
                 print(f"  Image path: {img_path}")
                 print(f"  Pred boxes: {len(pred_boxes)}, GT boxes: {len(gt_boxes)}")
                 
+                if gt_to_model_idx is not None:
+                    print(f"  GT index remapping: ENABLED")
+                else:
+                    print(f"  GT index remapping: DISABLED (indices assumed to match)")
+                
                 # IoU가 높은 pred-GT 쌍 찾아서 클래스 비교 (핵심 디버깅)
                 ious_debug = box_iou(pred_boxes, gt_boxes)
                 print(f"\n  [CLASS MAPPING DEBUG] High-IoU pairs:")
                 
-                # IoU > 0.5인 쌍 찾기
+                # IoU > 0.3인 쌍 찾기
                 high_iou_pairs = []
                 for p_idx in range(min(len(pred_boxes), 50)):
                     max_iou, max_gt_idx = ious_debug[p_idx].max(dim=0)
-                    if max_iou > 0.3:  # 0.3으로 낮춰서 더 많이 보기
+                    if max_iou > 0.3:
                         p_cls = pred_classes[p_idx].item()
+                        g_cls_orig = gt_classes_orig[max_gt_idx].item()
                         g_cls = gt_classes[max_gt_idx].item()
                         p_name = class_names.get(p_cls, f"?{p_cls}")
                         g_name = class_names.get(g_cls, f"?{g_cls}")
                         match = "MATCH" if p_cls == g_cls else "MISMATCH"
-                        high_iou_pairs.append(f"    IoU={max_iou:.2f}: pred[{p_cls}]={p_name} vs GT[{g_cls}]={g_name} [{match}]")
+                        # 원본 GT 인덱스와 변환된 인덱스 모두 표시
+                        if gt_to_model_idx is not None:
+                            high_iou_pairs.append(f"    IoU={max_iou:.2f}: pred[{p_cls}]={p_name} vs GT[{g_cls_orig}→{g_cls}]={g_name} [{match}]")
+                        else:
+                            high_iou_pairs.append(f"    IoU={max_iou:.2f}: pred[{p_cls}]={p_name} vs GT[{g_cls}]={g_name} [{match}]")
                 
                 if high_iou_pairs:
                     print(f"  Found {len(high_iou_pairs)} pairs with IoU>0.3:")
@@ -580,26 +600,60 @@ def main():
     print("\n--- Loading Classes from Data YAML ---")
     data = check_det_dataset(config.data_yaml)
     
-    # 클래스 파일이 있으면 그것을 사용 (converter가 저장한 것)
-    # 없으면 data yaml에서 로드
+    # 1. data.yaml에서 모델 클래스 이름 로드 (모델이 사용할 순서)
+    if isinstance(data["names"], dict):
+        sorted_keys = sorted(data["names"].keys())
+        model_names = [data["names"][k] for k in sorted_keys]
+    else:
+        model_names = list(data["names"])
+    
+    class_names = {i: name for i, name in enumerate(model_names)}
+    names = model_names
+    
+    # 2. classes_file이 있으면 GT 라벨 인덱스 -> 모델 인덱스 매핑 생성
+    # (convert_lvis_to_yolo.py가 생성한 파일 = 라벨 파일의 인덱스 순서)
     classes_file = args.classes_file if hasattr(args, 'classes_file') and args.classes_file else None
+    gt_to_model_idx = None
     
     if classes_file and Path(classes_file).exists():
-        print(f"Loading class names from: {classes_file}")
+        print(f"Loading GT label order from: {classes_file}")
         with open(classes_file, 'r') as f:
-            names = [line.strip() for line in f if line.strip()]
-        class_names = {i: name for i, name in enumerate(names)}
+            label_names = [line.strip() for line in f if line.strip()]
+        
+        # 모델 클래스 이름 -> 모델 인덱스 (슬래시 앞 부분만 비교용으로 추가)
+        name_to_model_idx = {}
+        for i, name in enumerate(model_names):
+            name_to_model_idx[name] = i
+            # 슬래시가 있으면 첫 부분도 등록
+            if "/" in name:
+                name_to_model_idx[name.split("/")[0]] = i
+        
+        # GT 라벨 인덱스 -> 모델 인덱스 매핑
+        gt_to_model_idx = {}
+        matched = 0
+        for label_idx, label_name in enumerate(label_names):
+            if label_name in name_to_model_idx:
+                gt_to_model_idx[label_idx] = name_to_model_idx[label_name]
+                matched += 1
+            elif label_name.split("/")[0] in name_to_model_idx:
+                gt_to_model_idx[label_idx] = name_to_model_idx[label_name.split("/")[0]]
+                matched += 1
+            else:
+                # 매핑 실패 - 그대로 유지 (경고)
+                gt_to_model_idx[label_idx] = label_idx
+        
+        print(f"  Label->Model index mapping: {matched}/{len(label_names)} classes matched")
+        
+        # 매핑 샘플 출력 (디버깅)
+        print(f"  Mapping samples:")
+        for i in [0, 1, 76, 430, len(label_names)-1]:
+            if i < len(label_names):
+                label_name = label_names[i]
+                model_idx = gt_to_model_idx.get(i, i)
+                model_name = model_names[model_idx] if model_idx < len(model_names) else "?"
+                print(f"    GT[{i}]={label_name} -> Model[{model_idx}]={model_name}")
     else:
-        # data["names"]는 {0: 'name0', 1: 'name1', ...} 또는 ['name0', 'name1', ...] 형태
-        # 반드시 key 순서로 정렬해야 라벨 인덱스와 일치함
-        if isinstance(data["names"], dict):
-            # key를 정렬하여 순서 보장 (0, 1, 2, ... 순서로)
-            sorted_keys = sorted(data["names"].keys())
-            names = [data["names"][k] for k in sorted_keys]
-            class_names = {i: name for i, name in enumerate(names)}
-        else:
-            names = list(data["names"])
-            class_names = {i: name for i, name in enumerate(names)}
+        print(f"  No classes_file provided or file not found. Assuming GT and model indices match.")
     
     print(f"train: {data.get('train')}")
     print(f"val: {data.get('val')}")
@@ -638,6 +692,7 @@ def main():
         
         logger = run_detection_phase(
             config, model, class_names, confounder_indices,
+            gt_to_model_idx=gt_to_model_idx,
             max_images=args.max_images,
             verbose=args.verbose,
         )
