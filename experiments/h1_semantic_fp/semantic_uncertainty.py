@@ -24,7 +24,7 @@ from .attribute_embeddings import AttributeEmbeddingCache, get_view_embeddings_f
 class YOLOEFeatureExtractor:
     """
     YOLOE에서 detection 시 visual feature를 추출하는 클래스
-    cv3 (visual embedding) 레이어의 output을 hook으로 캡처
+    cv3의 마지막 conv 전의 feature를 hook으로 캡처 (fuse 후에도 동작)
     """
     
     def __init__(self, model, device: str = "cuda"):
@@ -35,16 +35,25 @@ class YOLOEFeatureExtractor:
         """
         self.model = model
         self.device = device
-        self.cv3_features = []  # 각 scale의 cv3 output 저장
+        self.cv3_features = []  # 각 scale의 feature 저장
         self.hooks = []
         self._register_hooks()
     
     def _register_hooks(self):
-        """cv3 레이어에 hook 등록"""
+        """cv3의 마지막 conv 전 레이어에 hook 등록 (embed_dim 차원 유지)"""
         head = self.model.model.model[-1]  # YOLOEDetect or YOLOESegment
         
         for i, cv3_module in enumerate(head.cv3):
-            hook = cv3_module.register_forward_hook(
+            # cv3는 Sequential: [DWConv+Conv, DWConv+Conv, Conv2d]
+            # 마지막 Conv2d 전의 Sequential[1] output을 캡처
+            # fuse 후에도 Sequential[1]은 embed_dim 차원을 유지
+            if len(cv3_module) >= 2:
+                # Sequential[1] (두 번째 DWConv+Conv 블록)의 output 캡처
+                target_layer = cv3_module[1]
+            else:
+                target_layer = cv3_module[0]
+            
+            hook = target_layer.register_forward_hook(
                 lambda module, inp, out, idx=i: self._save_cv3_output(idx, out)
             )
             self.hooks.append(hook)
