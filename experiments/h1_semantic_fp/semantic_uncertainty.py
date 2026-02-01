@@ -24,7 +24,7 @@ from .attribute_embeddings import AttributeEmbeddingCache, get_view_embeddings_f
 class YOLOEFeatureExtractor:
     """
     YOLOE에서 detection 시 visual feature를 추출하는 클래스
-    cv3의 마지막 conv 전의 feature를 hook으로 캡처 (fuse 후에도 동작)
+    cv4 (BNContrastiveHead)의 input을 캡처하여 embed_dim 차원 feature 추출
     """
     
     def __init__(self, model, device: str = "cuda"):
@@ -40,23 +40,27 @@ class YOLOEFeatureExtractor:
         self._register_hooks()
     
     def _register_hooks(self):
-        """cv3의 마지막 conv 전 레이어에 hook 등록 (embed_dim 차원 유지)"""
+        """cv4의 input (= cv3 output, embed_dim 차원)을 캡처"""
         head = self.model.model.model[-1]  # YOLOEDetect or YOLOESegment
         
-        for i, cv3_module in enumerate(head.cv3):
-            # cv3는 Sequential: [DWConv+Conv, DWConv+Conv, Conv2d]
-            # 마지막 Conv2d 전의 Sequential[1] output을 캡처
-            # fuse 후에도 Sequential[1]은 embed_dim 차원을 유지
-            if len(cv3_module) >= 2:
-                # Sequential[1] (두 번째 DWConv+Conv 블록)의 output 캡처
-                target_layer = cv3_module[1]
-            else:
-                target_layer = cv3_module[0]
-            
-            hook = target_layer.register_forward_hook(
-                lambda module, inp, out, idx=i: self._save_cv3_output(idx, out)
+        # cv4 (BNContrastiveHead)의 forward 전에 input을 캡처
+        # cv4의 input x가 cv3의 output이며, [B, embed_dim, H, W] 형태
+        for i, cv4_module in enumerate(head.cv4):
+            # forward_pre_hook으로 input 캡처
+            hook = cv4_module.register_forward_pre_hook(
+                lambda module, inp, idx=i: self._save_cv4_input(idx, inp)
             )
             self.hooks.append(hook)
+    
+    def _save_cv4_input(self, idx: int, inputs):
+        """cv4의 input (cv3 output) 저장"""
+        # inputs는 tuple: (x, w) where x is visual feature, w is text embedding
+        if len(inputs) > 0:
+            x = inputs[0]  # [B, embed_dim, H, W]
+            if len(self.cv3_features) <= idx:
+                self.cv3_features.append(x.detach())
+            else:
+                self.cv3_features[idx] = x.detach()
     
     def _save_cv3_output(self, idx: int, output: torch.Tensor):
         """cv3 output 저장"""
