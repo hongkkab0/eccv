@@ -94,6 +94,10 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true",
                         help="Verbose output")
     
+    # 클래스 파일 (converter가 저장한 것 사용)
+    parser.add_argument("--classes-file", type=str, default=None,
+                        help="Path to classes.txt (from convert_lvis_to_yolo.py)")
+    
     return parser.parse_args()
 
 
@@ -566,17 +570,34 @@ def main():
     print("\n--- Loading Classes from Data YAML ---")
     data = check_det_dataset(config.data_yaml)
     
-    # data["names"]는 {0: 'name0', 1: 'name1', ...} 또는 ['name0', 'name1', ...] 형태
-    if isinstance(data["names"], dict):
-        class_names = data["names"]
-        names = [class_names[i] for i in range(len(class_names))]
-    else:
-        names = list(data["names"])
+    # 클래스 파일이 있으면 그것을 사용 (converter가 저장한 것)
+    # 없으면 data yaml에서 로드
+    classes_file = args.classes_file if hasattr(args, 'classes_file') and args.classes_file else None
+    
+    if classes_file and Path(classes_file).exists():
+        print(f"Loading class names from: {classes_file}")
+        with open(classes_file, 'r') as f:
+            names = [line.strip() for line in f if line.strip()]
         class_names = {i: name for i, name in enumerate(names)}
+    else:
+        # data["names"]는 {0: 'name0', 1: 'name1', ...} 또는 ['name0', 'name1', ...] 형태
+        # 반드시 key 순서로 정렬해야 라벨 인덱스와 일치함
+        if isinstance(data["names"], dict):
+            # key를 정렬하여 순서 보장 (0, 1, 2, ... 순서로)
+            sorted_keys = sorted(data["names"].keys())
+            names = [data["names"][k] for k in sorted_keys]
+            class_names = {i: name for i, name in enumerate(names)}
+        else:
+            names = list(data["names"])
+            class_names = {i: name for i, name in enumerate(names)}
     
     print(f"train: {data.get('train')}")
     print(f"val: {data.get('val')}")
     print(f"nc: {data.get('nc')}, names_len: {len(names)}")
+    
+    # 클래스 순서 확인용 출력
+    print(f"First 5 classes: {names[:5]}")
+    print(f"Last 5 classes: {names[-5:]}")
     
     # Confounder indices도 동일한 인덱스 체계로 구축
     confounder_indices = build_confounder_set(class_names)
