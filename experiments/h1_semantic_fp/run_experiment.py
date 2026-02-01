@@ -429,11 +429,9 @@ def run_embedding_phase(config: ExperimentConfig,
     print("Phase 2: Attribute Embedding Generation")
     print("="*60)
     
-    # Phase 2/3에서는 CLIP 사용 (MobileCLIP 체크포인트 형식 문제 회피)
-    embedding_text_model = "clip:ViT-B/32"
-    
+    # MobileCLIP 사용 (캐시 있으면 캐시 사용, 없으면 모델 로드)
     generator = AttributeEmbeddingGenerator(
-        text_model_name=embedding_text_model,
+        text_model_name=config.text_model,
         device=config.device,
         num_views=config.num_attribute_views,
     )
@@ -527,9 +525,9 @@ def run_evaluation_phase(config: ExperimentConfig,
     
     # 3.4 Artifactness Score (Track B)
     print("\n--- Artifactness Score Calculation ---")
-    # Phase 2/3에서는 CLIP 사용
+    # MobileCLIP 사용 (캐시 있으면 캐시 사용)
     art_scorer = ArtifactnessScorer(
-        text_model_name="clip:ViT-B/32",
+        text_model_name=config.text_model,
         device=config.device,
         method="margin",
     )
@@ -758,9 +756,9 @@ def main():
             config, class_names, verbose=args.verbose
         )
         
-        # 캐시 저장 (Phase 2/3에서는 CLIP 사용)
+        # 캐시 저장
         generator = AttributeEmbeddingGenerator(
-            text_model_name="clip:ViT-B/32",
+            text_model_name=config.text_model,
             device=config.device
         )
         generator.save_cache(attribute_cache, output_dir / "attribute_cache.json")

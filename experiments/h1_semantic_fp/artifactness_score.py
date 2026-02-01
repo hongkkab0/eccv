@@ -73,16 +73,19 @@ class ArtifactnessScorer:
     def __init__(self,
                  text_model_name: str = "mobileclip:blt",
                  device: str = "cuda",
-                 method: str = "margin"):
+                 method: str = "margin",
+                 cache_path: str = "tools/mobileclip_blt/artifactness_embeddings.pt"):
         """
         Args:
             text_model_name: 텍스트 모델 이름
             device: 디바이스
+            cache_path: 미리 생성된 임베딩 캐시 경로
             method: "max" 또는 "margin"
         """
         self.text_model_name = text_model_name
         self.device = device
         self.method = method
+        self.cache_path = cache_path
         
         self.prompts = ArtifactnessPrompts()
         
@@ -93,20 +96,38 @@ class ArtifactnessScorer:
         self._initialize_embeddings()
     
     def _initialize_embeddings(self):
-        """프롬프트 임베딩 초기화"""
-        from ultralytics.nn.text_model import build_text_model
+        """프롬프트 임베딩 초기화 (캐시 우선)"""
+        from pathlib import Path
+        cache_file = Path(self.cache_path)
         
-        text_model = build_text_model(self.text_model_name, device=self.device)
-        text_model.eval()
-        
-        with torch.no_grad():
-            # Depiction 임베딩
-            dep_tokens = text_model.tokenize(self.prompts.depiction_prompts)
-            self.depiction_embeddings = text_model.encode_text(dep_tokens).cpu().numpy()
+        if cache_file.exists():
+            print(f"  Loading cached artifactness embeddings from {self.cache_path}...")
+            cached_emb = torch.load(cache_file, map_location=self.device)
             
-            # Real 임베딩
-            real_tokens = text_model.tokenize(self.prompts.real_prompts)
-            self.real_embeddings = text_model.encode_text(real_tokens).cpu().numpy()
+            # 캐시에서 임베딩 추출
+            dep_list = [cached_emb[text] for text in self.prompts.depiction_prompts if text in cached_emb]
+            real_list = [cached_emb[text] for text in self.prompts.real_prompts if text in cached_emb]
+            
+            if len(dep_list) > 0:
+                self.depiction_embeddings = torch.stack(dep_list).cpu().numpy()
+            if len(real_list) > 0:
+                self.real_embeddings = torch.stack(real_list).cpu().numpy()
+            print(f"  Loaded {len(dep_list)} depiction + {len(real_list)} real embeddings")
+        else:
+            print(f"  Cache not found at {self.cache_path}, loading text model...")
+            from ultralytics.nn.text_model import build_text_model
+            
+            text_model = build_text_model(self.text_model_name, device=self.device)
+            text_model.eval()
+            
+            with torch.no_grad():
+                # Depiction 임베딩
+                dep_tokens = text_model.tokenize(self.prompts.depiction_prompts)
+                self.depiction_embeddings = text_model.encode_text(dep_tokens).cpu().numpy()
+                
+                # Real 임베딩
+                real_tokens = text_model.tokenize(self.prompts.real_prompts)
+                self.real_embeddings = text_model.encode_text(real_tokens).cpu().numpy()
     
     def compute_score(self, region_feature: np.ndarray) -> float:
         """

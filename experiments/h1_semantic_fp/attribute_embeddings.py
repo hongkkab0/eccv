@@ -103,33 +103,58 @@ class AttributeEmbeddingGenerator:
     def __init__(self, 
                  text_model_name: str = "mobileclip:blt",
                  device: str = "cuda",
-                 num_views: int = 5):
+                 num_views: int = 5,
+                 cache_path: str = "tools/mobileclip_blt/lvis_attribute_embeddings.pt"):
         """
         Args:
-            text_model_name: 텍스트 모델 이름 (e.g., "clip:ViT-B/32")
+            text_model_name: 텍스트 모델 이름 (e.g., "mobileclip:blt")
             device: 디바이스
             num_views: view 수 (K)
+            cache_path: 미리 생성된 임베딩 캐시 경로
         """
         self.text_model_name = text_model_name
         self.device = device
         self.num_views = num_views
+        self.cache_path = cache_path
         
-        # 텍스트 모델 로드
+        # 캐시된 임베딩 로드 시도
+        self.cached_embeddings = None
         self.text_model = None
-        self._load_text_model()
+        self._load_embeddings()
     
-    def _load_text_model(self):
-        """텍스트 모델 로드"""
-        from ultralytics.nn.text_model import build_text_model
-        self.text_model = build_text_model(self.text_model_name, device=self.device)
-        self.text_model.eval()
+    def _load_embeddings(self):
+        """캐시된 임베딩 로드 또는 텍스트 모델 로드"""
+        from pathlib import Path
+        cache_file = Path(self.cache_path)
+        
+        if cache_file.exists():
+            print(f"  Loading cached attribute embeddings from {self.cache_path}...")
+            self.cached_embeddings = torch.load(cache_file, map_location=self.device)
+            print(f"  Loaded {len(self.cached_embeddings)} cached embeddings")
+        else:
+            print(f"  Cache not found at {self.cache_path}, loading text model...")
+            from ultralytics.nn.text_model import build_text_model
+            self.text_model = build_text_model(self.text_model_name, device=self.device)
+            self.text_model.eval()
     
     @torch.no_grad()
     def _encode_texts(self, texts: List[str]) -> np.ndarray:
-        """텍스트를 임베딩으로 인코딩"""
-        tokens = self.text_model.tokenize(texts)
-        embeddings = self.text_model.encode_text(tokens)
-        return embeddings.cpu().numpy()
+        """텍스트를 임베딩으로 인코딩 (캐시 우선)"""
+        if self.cached_embeddings is not None:
+            # 캐시에서 임베딩 가져오기
+            embeddings = []
+            for text in texts:
+                if text in self.cached_embeddings:
+                    embeddings.append(self.cached_embeddings[text])
+                else:
+                    # 캐시에 없으면 에러 (또는 fallback)
+                    raise KeyError(f"Text '{text}' not found in cached embeddings")
+            return torch.stack(embeddings).cpu().numpy()
+        else:
+            # 텍스트 모델로 인코딩
+            tokens = self.text_model.tokenize(texts)
+            embeddings = self.text_model.encode_text(tokens)
+            return embeddings.cpu().numpy()
     
     def generate_class_views(self, 
                              class_name: str,
