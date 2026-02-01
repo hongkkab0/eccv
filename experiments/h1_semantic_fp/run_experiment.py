@@ -101,23 +101,70 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_text_embeddings_with_model(model: YOLOE, names: list) -> torch.Tensor:
+def get_text_embeddings_cached(model: YOLOE, names: list, cache_path: str = None) -> torch.Tensor:
     """
-    YOLOE 모델의 get_text_pe()를 사용하여 텍스트 임베딩 생성
+    LVIS 클래스 텍스트 임베딩 생성 (캐시 지원)
     
-    중요: 
-    - YOLOE는 MobileCLIP으로 훈련됨 → MobileCLIP 사용 필수
-    - head.get_tpe()를 거쳐야 올바른 형식이 됨
-    - mobileclip_blt.pt 파일이 현재 디렉토리에 있어야 함
+    캐시 파일이 있으면 로드, 없으면 MobileCLIP으로 생성 후 저장
     
     Args:
         model: YOLOE 모델
         names: 클래스 이름 리스트  
+        cache_path: 캐시 파일 경로 (예: tools/mobileclip:blt/lvis_embeddings.pt)
     """
-    print(f"  Building text embeddings for {len(names)} classes using MobileCLIP (model default)...")
+    import torch.nn.functional as F
     
-    # 모델의 get_text_pe() 사용 - MobileCLIP + head.get_tpe()
+    # 캐시 파일 경로 설정
+    if cache_path is None:
+        cache_path = "tools/mobileclip:blt/lvis_embeddings.pt"
+    
+    cache_file = Path(cache_path)
+    
+    # 캐시가 있으면 로드
+    if cache_file.exists():
+        print(f"  Loading cached embeddings from {cache_path}...")
+        cached_data = torch.load(cache_file, map_location=model.device)
+        
+        # 캐시된 임베딩에서 현재 names 순서대로 추출
+        if isinstance(cached_data, dict):
+            # {name: embedding} 형태
+            txt_feats_list = []
+            missing_names = []
+            for name in names:
+                if name in cached_data:
+                    txt_feats_list.append(cached_data[name])
+                else:
+                    missing_names.append(name)
+                    # 없으면 zero vector (나중에 처리)
+                    txt_feats_list.append(torch.zeros_like(next(iter(cached_data.values()))))
+            
+            if missing_names:
+                print(f"  WARNING: {len(missing_names)} names not in cache: {missing_names[:5]}...")
+            
+            txt_feats = torch.stack(txt_feats_list).unsqueeze(0).to(model.device)
+        else:
+            # [1, num_classes, dim] 형태
+            txt_feats = cached_data.to(model.device)
+        
+        # head.get_tpe() 적용 (L2 정규화)
+        head = model.model.model[-1]
+        tpe = F.normalize(txt_feats, dim=-1, p=2)
+        return tpe
+    
+    # 캐시가 없으면 생성 (MobileCLIP 필요)
+    print(f"  Building text embeddings for {len(names)} classes using MobileCLIP...")
+    print(f"  (This requires mobileclip_blt.pt in current directory)")
+    
     tpe = model.get_text_pe(names)
+    
+    # 캐시로 저장
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    # {name: embedding} 형태로 저장
+    txt_feats_dict = {}
+    for i, name in enumerate(names):
+        txt_feats_dict[name] = tpe[0, i].cpu()
+    torch.save(txt_feats_dict, cache_file)
+    print(f"  Saved embeddings cache to {cache_path}")
     
     return tpe
 
@@ -148,12 +195,11 @@ def run_detection_phase(config: ExperimentConfig,
         top_k=config.top_m_classes,
     )
     
-    # 모델 설정 - 공식 YOLOE 방식: model.get_text_pe() 사용
-    # MobileCLIP 체크포인트 (mobileclip_blt.pt)가 현재 디렉토리에 필요함
+    # 모델 설정 - 텍스트 임베딩 생성 (캐시 지원)
+    # 캐시가 없으면 MobileCLIP으로 생성 (mobileclip_blt.pt 필요)
     names = [class_names[i] for i in range(len(class_names))]
     names = [name.split("/")[0] for name in names]  # 슬래시 앞부분만 사용
-    print(f"  Building text embeddings for {len(names)} classes...")
-    tpe = model.get_text_pe(names)
+    tpe = get_text_embeddings_cached(model, names)
     model.set_classes(names, tpe)
     
     # Validation 데이터셋 로드
