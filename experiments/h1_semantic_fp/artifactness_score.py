@@ -1,16 +1,21 @@
 """
 Artifactness Score Calculation (Track B)
 =========================================
-Visual Primitives → Artifactness score
+MobileCLIP 기반 Visual Primitives → Artifactness score
 
 "is it a toy?", "is it a statue?" 등의 판별 질문을 사용한
 depiction/replica 탐지 점수
+
+SemanticUncertaintyCalculator와 같은 MobileCLIP 모델 사용
+→ 동일한 image embedding 재활용 가능
 """
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from typing import List, Dict, Optional
 from dataclasses import dataclass
+from PIL import Image
 
 from .detection_logger import Detection
 
@@ -63,12 +68,14 @@ class ArtifactnessPrompts:
 
 class ArtifactnessScorer:
     """
-    Artifactness score 계산기 (CLIP 기반)
+    Artifactness score 계산기 (MobileCLIP 기반)
     
-    CLIP으로 bbox crop embedding과 depiction/real prompt의 similarity 비교
-    - s_art = max_j <f, T(depiction_j)> - mean(<f, T(real)>)
+    SemanticUncertaintyCalculator와 같은 MobileCLIP 사용
+    → 동일한 image embedding을 재활용하여 효율적
     
-    SemanticUncertaintyCalculator와 같은 CLIP 모델 사용
+    Score 계산:
+    - s_art = max(<f, depiction>) - max(<f, real>)
+    - 높을수록 depiction/replica일 가능성 높음
     """
     
     def __init__(self,
@@ -84,55 +91,86 @@ class ArtifactnessScorer:
         
         self.prompts = ArtifactnessPrompts()
         
-        # CLIP 모델 로드
-        self.clip_model = None
-        self.clip_preprocess = None
+        # MobileCLIP 모델
+        self.model = None
+        self.preprocess = None
+        self.tokenizer = None
         
         # 임베딩 캐시
         self.depiction_embeddings: Optional[np.ndarray] = None
         self.real_embeddings: Optional[np.ndarray] = None
         
-        self._initialize_clip()
+        self._initialize_mobileclip()
     
-    def _initialize_clip(self):
-        """CLIP 모델 및 임베딩 초기화"""
+    def _initialize_mobileclip(self):
+        """MobileCLIP 모델 및 임베딩 초기화"""
+        try:
+            import mobileclip
+            
+            # MobileCLIP-B (blt) - YOLOE default
+            self.model, _, self.preprocess = mobileclip.create_model_and_transforms(
+                'mobileclip_blt', 
+                pretrained='checkpoints/mobileclip_blt.pt'
+            )
+            self.tokenizer = mobileclip.get_tokenizer('mobileclip_blt')
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            
+            print(f"  Loaded MobileCLIP-BLT for artifactness scoring")
+            
+        except Exception as e:
+            print(f"  WARNING: MobileCLIP load failed ({e}), falling back to CLIP")
+            self._load_clip_fallback()
+        
+        # Text embeddings 생성
+        self._build_text_embeddings()
+    
+    def _load_clip_fallback(self):
+        """CLIP fallback"""
         try:
             import clip
-            self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
-            self.clip_model.eval()
-            print(f"  Loaded CLIP ViT-B/32 for artifactness scoring")
-            
-            # Text embeddings 생성
-            with torch.no_grad():
-                # Depiction 임베딩
-                dep_tokens = clip.tokenize(self.prompts.depiction_prompts).to(self.device)
-                dep_feats = self.clip_model.encode_text(dep_tokens)
-                dep_feats = dep_feats / dep_feats.norm(dim=-1, keepdim=True)
-                self.depiction_embeddings = dep_feats.cpu().numpy()
-                
-                # Real 임베딩
-                real_tokens = clip.tokenize(self.prompts.real_prompts).to(self.device)
-                real_feats = self.clip_model.encode_text(real_tokens)
-                real_feats = real_feats / real_feats.norm(dim=-1, keepdim=True)
-                self.real_embeddings = real_feats.cpu().numpy()
-            
-            print(f"  Built {len(self.prompts.depiction_prompts)} depiction + {len(self.prompts.real_prompts)} real embeddings")
-            
+            self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+            self.tokenizer = clip.tokenize
+            self.model.eval()
+            print(f"  Loaded CLIP ViT-B/32 (fallback)")
         except ImportError:
-            print("  WARNING: clip not installed")
+            print("  WARNING: Neither MobileCLIP nor CLIP available")
     
-    def compute_score(self, region_feature: np.ndarray) -> float:
+    def _build_text_embeddings(self):
+        """Text embeddings 생성"""
+        if self.model is None:
+            return
+        
+        with torch.no_grad():
+            # Depiction 임베딩
+            dep_tokens = self.tokenizer(self.prompts.depiction_prompts).to(self.device)
+            dep_feats = self.model.encode_text(dep_tokens)
+            dep_feats = F.normalize(dep_feats, dim=-1)
+            self.depiction_embeddings = dep_feats.cpu().numpy()
+            
+            # Real 임베딩
+            real_tokens = self.tokenizer(self.prompts.real_prompts).to(self.device)
+            real_feats = self.model.encode_text(real_tokens)
+            real_feats = F.normalize(real_feats, dim=-1)
+            self.real_embeddings = real_feats.cpu().numpy()
+        
+        print(f"  Built {len(self.prompts.depiction_prompts)} depiction + {len(self.prompts.real_prompts)} real embeddings")
+    
+    def compute_score(self, image_embedding: np.ndarray) -> float:
         """
-        단일 region feature의 artifactness score 계산
+        Image embedding의 artifactness score 계산
         
         Args:
-            region_feature: [embed_dim]
+            image_embedding: [embed_dim] - 이미 정규화된 embedding
         
         Returns:
             Artifactness score
         """
-        # 정규화
-        f_norm = region_feature / (np.linalg.norm(region_feature) + 1e-10)
+        if self.depiction_embeddings is None or self.real_embeddings is None:
+            return 0.0
+        
+        # 정규화 확인
+        f_norm = image_embedding / (np.linalg.norm(image_embedding) + 1e-10)
         
         # Depiction 유사도
         dep_sims = np.dot(self.depiction_embeddings, f_norm)
@@ -152,14 +190,14 @@ class ArtifactnessScorer:
         else:
             raise ValueError(f"Unknown method: {self.method}")
     
-    def compute_detailed_scores(self, region_feature: np.ndarray) -> Dict:
+    def compute_detailed_scores(self, image_embedding: np.ndarray) -> Dict:
         """
         상세 점수 계산 (분석용)
         
         Returns:
             각 프롬프트별 유사도 딕셔너리
         """
-        f_norm = region_feature / (np.linalg.norm(region_feature) + 1e-10)
+        f_norm = image_embedding / (np.linalg.norm(image_embedding) + 1e-10)
         
         dep_sims = np.dot(self.depiction_embeddings, f_norm)
         real_sims = np.dot(self.real_embeddings, f_norm)
@@ -178,24 +216,24 @@ class ArtifactnessScorer:
             "margin": float(np.max(dep_sims) - np.max(real_sims)),
         }
     
-    def compute_for_detection(self, detection: Detection, image_emb: np.ndarray = None) -> float:
+    def compute_for_detection(self, detection: Detection, 
+                               image_emb: Optional[np.ndarray] = None) -> float:
         """
         Detection의 artifactness score 계산
         
         Args:
             detection: Detection 객체
-            image_emb: 미리 계산된 CLIP image embedding (없으면 직접 계산)
+            image_emb: 미리 계산된 image embedding (u_sem에서 재활용)
         """
-        # image_emb가 제공되면 사용
+        # image_emb가 제공되면 사용 (효율적)
         if image_emb is not None:
             return self.compute_score(image_emb)
         
-        # 없으면 직접 CLIP encoding
-        if detection.image_path is None or self.clip_model is None:
+        # 없으면 직접 계산
+        if detection.image_path is None or self.model is None:
             return 0.0
         
         try:
-            from PIL import Image
             img = Image.open(detection.image_path).convert('RGB')
             
             # Crop
@@ -208,11 +246,11 @@ class ArtifactnessScorer:
             
             crop = img.crop((x1, y1, x2, y2))
             
-            # CLIP encoding
+            # MobileCLIP encoding
             with torch.no_grad():
-                crop_tensor = self.clip_preprocess(crop).unsqueeze(0).to(self.device)
-                features = self.clip_model.encode_image(crop_tensor)
-                features = features / features.norm(dim=-1, keepdim=True)
+                crop_tensor = self.preprocess(crop).unsqueeze(0).to(self.device)
+                features = self.model.encode_image(crop_tensor)
+                features = F.normalize(features, dim=-1)
                 image_emb = features.cpu().numpy().squeeze()
             
             return self.compute_score(image_emb)
@@ -221,13 +259,13 @@ class ArtifactnessScorer:
             return 0.0
     
     def compute_for_detections(self, detections: List[Detection], 
-                                image_embs: List[np.ndarray] = None) -> np.ndarray:
+                                image_embs: Optional[List[np.ndarray]] = None) -> np.ndarray:
         """
         여러 detection의 artifactness score 일괄 계산
         
         Args:
             detections: Detection 리스트
-            image_embs: 미리 계산된 CLIP image embeddings (없으면 직접 계산)
+            image_embs: 미리 계산된 image embeddings (u_sem에서 재활용)
         """
         scores = []
         for i, det in enumerate(detections):
@@ -235,99 +273,24 @@ class ArtifactnessScorer:
             scores.append(self.compute_for_detection(det, emb))
         return np.array(scores)
     
-    def compute_for_triad_split(self,
-                                triad_split: Dict[str, List[Detection]]) -> Dict[str, np.ndarray]:
-        """Triad split 각 그룹의 artifactness score 계산"""
-        return {
-            group: self.compute_for_detections(dets)
-            for group, dets in triad_split.items()
-        }
-
-
-class CombinedErrorScorer:
-    """
-    최종 error probability 계산
-    
-    u = σ(w1 * u_sem + w2 * s_art + w3 * u_ret + w4 * u_loc)
-    
-    현재는 u_sem + s_art 조합만 구현
-    """
-    
-    def __init__(self,
-                 w_sem: float = 1.0,
-                 w_art: float = 1.0,
-                 normalize: bool = True):
+    def compute_for_groups(self,
+                           groups: Dict[str, List[Detection]],
+                           group_embeddings: Optional[Dict[str, List[np.ndarray]]] = None
+                           ) -> Dict[str, np.ndarray]:
         """
-        Args:
-            w_sem: u_sem 가중치
-            w_art: s_art 가중치
-            normalize: 점수 정규화 여부
-        """
-        self.w_sem = w_sem
-        self.w_art = w_art
-        self.normalize = normalize
-    
-    def compute_combined_score(self,
-                               u_sem: float,
-                               s_art: float,
-                               u_sem_stats: Optional[Dict] = None,
-                               s_art_stats: Optional[Dict] = None) -> float:
-        """
-        결합 점수 계산
+        그룹별 artifactness score 계산
         
         Args:
-            u_sem: Semantic uncertainty
-            s_art: Artifactness score
-            u_sem_stats: u_sem 정규화용 통계 (mean, std)
-            s_art_stats: s_art 정규화용 통계
+            groups: {group_name: [Detection, ...]}
+            group_embeddings: {group_name: [image_emb, ...]}
         
         Returns:
-            결합 점수
+            {group_name: np.ndarray of scores}
         """
-        if self.normalize:
-            if u_sem_stats:
-                u_sem = (u_sem - u_sem_stats.get("mean", 0)) / (u_sem_stats.get("std", 1) + 1e-10)
-            if s_art_stats:
-                s_art = (s_art - s_art_stats.get("mean", 0)) / (s_art_stats.get("std", 1) + 1e-10)
-        
-        # 선형 조합
-        combined = self.w_sem * u_sem + self.w_art * s_art
-        
-        # Sigmoid로 확률화
-        prob = 1.0 / (1.0 + np.exp(-combined))
-        
-        return prob
-    
-    def compute_for_arrays(self,
-                           u_sem_array: np.ndarray,
-                           s_art_array: np.ndarray) -> np.ndarray:
-        """배열 단위 계산"""
-        # 정규화
-        if self.normalize:
-            u_sem_array = (u_sem_array - np.mean(u_sem_array)) / (np.std(u_sem_array) + 1e-10)
-            s_art_array = (s_art_array - np.mean(s_art_array)) / (np.std(s_art_array) + 1e-10)
-        
-        combined = self.w_sem * u_sem_array + self.w_art * s_art_array
-        probs = 1.0 / (1.0 + np.exp(-combined))
-        
-        return probs
-
-
-def analyze_artifactness_statistics(s_art_by_group: Dict[str, np.ndarray]) -> Dict:
-    """Artifactness score 통계 분석"""
-    stats = {}
-    
-    for group, values in s_art_by_group.items():
-        if len(values) == 0:
-            continue
-        
-        stats[group] = {
-            "count": len(values),
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-            "min": float(np.min(values)),
-            "max": float(np.max(values)),
-            "median": float(np.median(values)),
-        }
-    
-    return stats
+        results = {}
+        for group_name, dets in groups.items():
+            embs = group_embeddings.get(group_name) if group_embeddings else None
+            results[group_name] = self.compute_for_detections(dets, embs)
+            print(f"    {group_name}: {len(dets)} detections, "
+                  f"mean s_art={results[group_name].mean():.4f}")
+        return results

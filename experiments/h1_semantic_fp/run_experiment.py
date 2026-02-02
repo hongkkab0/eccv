@@ -43,12 +43,9 @@ from .attribute_embeddings import (
 )
 from .semantic_uncertainty import (
     SemanticUncertaintyCalculator,
-    analyze_u_sem_statistics,
+    EnhancedTriadSplit,
 )
-from .artifactness_score import (
-    ArtifactnessScorer,
-    analyze_artifactness_statistics,
-)
+from .artifactness_score import ArtifactnessScorer
 from .h1_metrics import (
     H1Evaluator,
     format_h1_results,
@@ -457,20 +454,34 @@ def run_evaluation_phase(config: ExperimentConfig,
                          output_dir: Path,
                          verbose: bool = False):
     """
-    Phase 3: Confidence matching, u_sem 계산, H1 검증
+    Phase 3: Confidence matching, u_sem/s_art 계산, H1 검증
     
-    Args:
-        model: YOLOE 모델 (cv4 접근용)
+    MobileCLIP 기반:
+    - bbox crop → MobileCLIP image embedding
+    - Top-M gating + JS divergence = u_sem
+    - 같은 embedding으로 s_art 계산
     """
     print("\n" + "="*60)
-    print("Phase 3: Evaluation")
+    print("Phase 3: Evaluation (MobileCLIP)")
     print("="*60)
     
-    # 3.1 Triad Split
-    print("\n--- Triad Split ---")
+    # 3.1 기존 Triad Split
+    print("\n--- Original Triad Split ---")
     triad_split = logger.get_triad_split()
     
     for group, dets in triad_split.items():
+        print(f"  {group}: {len(dets)} detections")
+    
+    # 3.1b Enhanced Triad Split (Depiction FP 분리)
+    print("\n--- Enhanced Triad Split (H1 focused) ---")
+    enhanced_splitter = EnhancedTriadSplit(class_names)
+    
+    all_detections = []
+    for group, dets in triad_split.items():
+        all_detections.extend(dets)
+    
+    enhanced_split = enhanced_splitter.split_detections(all_detections)
+    for group, dets in enhanced_split.items():
         print(f"  {group}: {len(dets)} detections")
     
     # 3.2 Confidence Matching
@@ -497,63 +508,88 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (CLIP 기반)
-    print("\n--- Semantic Uncertainty Calculation (CLIP scorer) ---")
+    # 3.3 MobileCLIP 기반 u_sem 계산
+    print("\n--- Semantic Uncertainty (MobileCLIP + Top-M Gating) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
         class_names=class_names,
         device=config.device,
+        temperature=10.0,  # 분포 부드럽게
+        top_m=config.top_m_classes,
     )
     
-    # YOLOE feature로 u_sem 계산
+    # u_sem 계산 + image embedding 수집 (artifactness 재활용)
     u_sem_by_group = {}
+    image_embs_by_group = {}
+    
     for group_name, detections in matched_data.items():
-        if not isinstance(detections, list):
+        if not isinstance(detections, list) or len(detections) == 0:
             continue
         print(f"  Computing u_sem for {group_name} ({len(detections)} samples)...")
-        u_sems = u_sem_calculator.compute_for_detections(detections, use_gating=False)
+        u_sems, image_embs = u_sem_calculator.compute_for_detections(detections, verbose=True)
         u_sem_by_group[group_name] = u_sems
-    u_sem_stats = analyze_u_sem_statistics(u_sem_by_group)
+        image_embs_by_group[group_name] = image_embs
     
-    print(f"  u_sem statistics:")
-    for group, stats in u_sem_stats.items():
-        if isinstance(stats, dict):
-            def _fmt(v):
-                return f"{v:.8e}" if isinstance(v, float) else v
-            summary = {k: _fmt(v) for k, v in stats.items()}
-            print(f"    {group}: {summary}")
+    # u_sem 통계
+    print(f"\n  u_sem statistics:")
+    for group, u_sems in u_sem_by_group.items():
+        valid_mask = ~np.isnan(u_sems) & (u_sems > 0)
+        valid_u = u_sems[valid_mask]
+        if len(valid_u) > 0:
+            print(f"    {group}: mean={valid_u.mean():.4f}, std={valid_u.std():.4f}, "
+                  f"min={valid_u.min():.4f}, max={valid_u.max():.4f}, n={len(valid_u)}")
+        else:
+            print(f"    {group}: no valid samples")
     
-    # 3.4 Artifactness Score (Track B) - CLIP 기반
-    print("\n--- Artifactness Score Calculation (CLIP) ---")
+    # 3.4 Artifactness Score (같은 MobileCLIP embedding 재활용)
+    print("\n--- Artifactness Score (MobileCLIP, reusing embeddings) ---")
     art_scorer = ArtifactnessScorer(
         device=config.device,
         method="margin",
     )
     
-    s_art_by_group = art_scorer.compute_for_triad_split(matched_data)
-    s_art_stats = analyze_artifactness_statistics(s_art_by_group)
-    
-    print(f"  Artifactness statistics:")
-    for group, stats in s_art_stats.items():
-        print(f"    {group}: mean={stats['mean']:.4f}, std={stats['std']:.4f}")
+    s_art_by_group = {}
+    for group_name, detections in matched_data.items():
+        if not isinstance(detections, list) or len(detections) == 0:
+            continue
+        embs = image_embs_by_group.get(group_name)
+        s_arts = art_scorer.compute_for_detections(detections, embs)
+        s_art_by_group[group_name] = s_arts
+        print(f"    {group_name}: mean s_art={s_arts.mean():.4f}, std={s_arts.std():.4f}")
     
     # 3.5 H1 검증
     print("\n--- H1 Verification ---")
     evaluator = H1Evaluator()
     
-    conf_tp = np.array([d.confidence for d in matched_data["TP"]])
-    conf_sem_fp = np.array([d.confidence for d in matched_data["Semantic_FP"]])
-    
-    h1_result = evaluator.evaluate(
-        u_sem_tp=u_sem_by_group["TP"],
-        u_sem_semantic_fp=u_sem_by_group["Semantic_FP"],
-        confidence_tp=conf_tp,
-        confidence_semantic_fp=conf_sem_fp,
-    )
-    
-    print(format_h1_results(h1_result))
+    # TP vs Semantic_FP 비교
+    if "TP" in matched_data and "Semantic_FP" in matched_data:
+        conf_tp = np.array([d.confidence for d in matched_data["TP"]])
+        conf_sem_fp = np.array([d.confidence for d in matched_data["Semantic_FP"]])
+        
+        h1_result = evaluator.evaluate(
+            u_sem_tp=u_sem_by_group.get("TP", np.array([])),
+            u_sem_semantic_fp=u_sem_by_group.get("Semantic_FP", np.array([])),
+            confidence_tp=conf_tp,
+            confidence_semantic_fp=conf_sem_fp,
+        )
+        
+        print(format_h1_results(h1_result))
+    else:
+        print("  WARNING: Missing TP or Semantic_FP group for H1 evaluation")
+        h1_result = None
     
     # 3.6 결과 저장
     print("\n--- Saving Results ---")
+    
+    # u_sem/s_art 통계 직접 계산
+    u_sem_stats = {}
+    for group, u_sems in u_sem_by_group.items():
+        valid = u_sems[~np.isnan(u_sems) & (u_sems > 0)]
+        if len(valid) > 0:
+            u_sem_stats[group] = {"mean": float(valid.mean()), "std": float(valid.std()), "n": len(valid)}
+    
+    s_art_stats = {}
+    for group, s_arts in s_art_by_group.items():
+        s_art_stats[group] = {"mean": float(s_arts.mean()), "std": float(s_arts.std()), "n": len(s_arts)}
     
     # JSON 결과
     results = {
@@ -563,12 +599,17 @@ def run_evaluation_phase(config: ExperimentConfig,
             "iou_threshold": config.iou_threshold,
             "top_m": config.top_m_classes,
             "num_views": config.num_attribute_views,
+            "temperature": 10.0,
         },
         "detection_stats": logger.get_stats(),
+        "enhanced_split": {k: len(v) for k, v in enhanced_split.items()},
         "matching_verification": verification,
         "u_sem_stats": u_sem_stats,
         "s_art_stats": s_art_stats,
-        "h1_result": {
+    }
+    
+    if h1_result:
+        results["h1_result"] = {
             "auroc_u_sem": h1_result.auroc_u_sem,
             "aupr_u_sem": h1_result.aupr_u_sem,
             "auroc_confidence": h1_result.auroc_confidence,
@@ -577,32 +618,33 @@ def run_evaluation_phase(config: ExperimentConfig,
             "n_tp": h1_result.n_tp,
             "n_semantic_fp": h1_result.n_semantic_fp,
         }
-    }
     
     with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
     
     # 시각화
     print("\n--- Generating Visualizations ---")
-    confidence_data = {
-        "TP": conf_tp,
-        "Semantic_FP": conf_sem_fp,
-        "Background_FP": np.array([d.confidence for d in matched_data["Background_FP"]]),
-    }
-    
-    roc_data = evaluator.get_roc_curve_data(
-        u_sem_by_group["TP"],
-        u_sem_by_group["Semantic_FP"],
-    )
-    
-    save_all_figures(
-        output_dir / "figures",
-        confidence_data,
-        u_sem_by_group,
-        roc_data,
-        h1_result.auroc_u_sem,
-        logger.get_stats(),
-    )
+    if h1_result and "TP" in matched_data and "Semantic_FP" in matched_data:
+        confidence_data = {
+            "TP": conf_tp,
+            "Semantic_FP": conf_sem_fp,
+        }
+        if "Background_FP" in matched_data:
+            confidence_data["Background_FP"] = np.array([d.confidence for d in matched_data["Background_FP"]])
+        
+        roc_data = evaluator.get_roc_curve_data(
+            u_sem_by_group["TP"],
+            u_sem_by_group["Semantic_FP"],
+        )
+        
+        save_all_figures(
+            output_dir / "figures",
+            confidence_data,
+            u_sem_by_group,
+            roc_data,
+            h1_result.auroc_u_sem,
+            logger.get_stats(),
+        )
     
     print(f"\nAll results saved to {output_dir}")
     
@@ -774,10 +816,15 @@ def main():
     print("\n" + "="*60)
     print("Experiment Complete!")
     print("="*60)
-    print(f"\nKey Results:")
-    print(f"  u_sem AUROC: {h1_result.auroc_u_sem:.4f}")
-    print(f"  Confidence AUROC (baseline): {h1_result.auroc_confidence:.4f}")
-    print(f"  Cohen's d: {h1_result.cohens_d_u_sem:.4f}")
+    if h1_result:
+        print(f"\nKey Results:")
+        print(f"  u_sem AUROC: {h1_result.auroc_u_sem:.4f}")
+        print(f"  Confidence AUROC (baseline): {h1_result.auroc_confidence:.4f}")
+        print(f"  Cohen's d: {h1_result.cohens_d_u_sem:.4f}")
+    else:
+        print("\n  H1 evaluation skipped (missing data)")
+    
+    print(f"\nOutput: {output_dir}")
 
 
 if __name__ == "__main__":

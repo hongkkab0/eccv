@@ -48,16 +48,33 @@ class MobileCLIP(TextModel):
     def __init__(self, size, device):
         super().__init__()
         config = self.config_size_map[size]
-        self.model = mobileclip.create_model_and_transforms(f'mobileclip_{config}', pretrained=f'mobileclip_{size}.pt', device=device)[0]
-        self.tokenizer = mobileclip.get_tokenizer(f'mobileclip_{config}')
+        
+        # OpenCLIP 형식 체크포인트 먼저 시도
+        try:
+            import open_clip
+            # OpenCLIP으로 MobileCLIP 로드 (blt = ViT-B-16-SigLIP-i18n-256 호환)
+            if size == 'blt':
+                self.model, _, _ = open_clip.create_model_and_transforms(
+                    'ViT-B-16-SigLIP-i18n-256',
+                    pretrained='mobileclip_blt.pt',
+                    device=device
+                )
+                self.tokenizer = open_clip.get_tokenizer('ViT-B-16-SigLIP-i18n-256')
+            else:
+                raise ValueError(f"OpenCLIP fallback only supports 'blt', got {size}")
+            LOGGER.info(f"Loaded MobileCLIP via OpenCLIP")
+        except Exception as e:
+            LOGGER.info(f"OpenCLIP load failed ({e}), trying original mobileclip...")
+            # 원본 mobileclip 라이브러리로 시도
+            self.model = mobileclip.create_model_and_transforms(f'mobileclip_{config}', pretrained=f'mobileclip_{size}.pt', device=device)[0]
+            self.tokenizer = mobileclip.get_tokenizer(f'mobileclip_{config}')
+        
         self.to(device)
         self.device = device
         self.eval()
     
     def tokenize(self, texts):
         text_tokens = self.tokenizer(texts).to(self.device)
-        # max_len = text_tokens.argmax(dim=-1).max().item() + 1
-        # text_tokens = text_tokens[..., :max_len]
         return text_tokens
 
     @smart_inference_mode()
