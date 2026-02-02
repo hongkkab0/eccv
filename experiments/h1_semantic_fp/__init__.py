@@ -65,18 +65,16 @@ from .attribute_embeddings import (
 
 from .semantic_uncertainty import (
     js_divergence,
-    compute_view_posterior,
-    compute_u_sem,
-    compute_u_sem_gated,
     SemanticUncertaintyCalculator,
-    analyze_u_sem_statistics,
+    EnhancedTriadSplit,
+    MobileCLIPScorer,
+    DEPICTION_REPLICA_CLASSES,
+    is_depiction_replica_class,
 )
 
 from .artifactness_score import (
     ArtifactnessPrompts,
     ArtifactnessScorer,
-    CombinedErrorScorer,
-    analyze_artifactness_statistics,
 )
 
 from .h1_metrics import (
@@ -117,12 +115,12 @@ __all__ = [
     
     # Semantic Uncertainty
     "js_divergence",
-    "compute_u_sem",
     "SemanticUncertaintyCalculator",
+    "EnhancedTriadSplit",
+    "MobileCLIPScorer",
     
     # Artifactness
     "ArtifactnessScorer",
-    "CombinedErrorScorer",
     
     # H1 Metrics
     "H1Evaluator",
