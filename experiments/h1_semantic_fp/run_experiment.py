@@ -409,8 +409,22 @@ def run_detection_phase(config: ExperimentConfig,
             det_cls_logits = None
             
             if anchor_xy is not None and anchor_strides is not None:
-                # anchor를 픽셀 좌표로 변환
-                anchor_px = anchor_xy * anchor_strides.unsqueeze(1)  # [A, 2]
+                # ===== anchor shape 정규화 (브로드캐스팅 버그 수정) =====
+                # anchor_xy: [A, 2] or [2, A] -> [A, 2]
+                _anchor_xy = anchor_xy.float()
+                if _anchor_xy.ndim == 2 and _anchor_xy.shape[0] == 2 and _anchor_xy.shape[1] != 2:
+                    _anchor_xy = _anchor_xy.t().contiguous()
+                _anchor_xy = _anchor_xy.reshape(-1, 2)  # [A, 2]
+                
+                # strides: [1, A] or [A] -> [A]
+                _strides = anchor_strides.float()
+                if _strides.ndim == 2:
+                    _strides = _strides.squeeze(0)
+                _strides = _strides.reshape(-1)  # [A]
+                
+                # anchor를 픽셀 좌표로 변환: [A, 2] * [A, 1] = [A, 2]
+                anchor_px = _anchor_xy * _strides[:, None]
+                # =========================================================
                 
                 det_feats = []
                 det_logits = []
@@ -976,6 +990,26 @@ def main():
     model = YOLOE(config.checkpoint)
     model.to(config.device)
     model.eval()
+    
+    # ===== fuse 자동 적용 방지 =====
+    # Ultralytics predictor가 자동으로 fuse를 호출하는 것을 막음
+    if hasattr(model, "overrides"):
+        model.overrides["fuse"] = False
+        print(f"  Disabled auto-fuse in model.overrides")
+    
+    if hasattr(model, "predictor") and model.predictor is not None:
+        if hasattr(model.predictor, "args"):
+            model.predictor.args.fuse = False
+            print(f"  Disabled auto-fuse in predictor.args")
+    
+    # 최후의 수단: fuse() 메서드 자체를 무력화
+    original_fuse = getattr(model, "fuse", None)
+    def noop_fuse(*args, **kwargs):
+        print(f"  [BLOCKED] model.fuse() call intercepted and skipped")
+        return model
+    model.fuse = noop_fuse
+    print(f"  Blocked model.fuse() method")
+    # ================================
     
     # fuse 상태 확인 (CRITICAL)
     head = model.model.model[-1]
