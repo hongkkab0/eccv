@@ -196,6 +196,51 @@ def js_divergence(distributions: np.ndarray, weights: Optional[np.ndarray] = Non
     return h_mean - h_individual
 
 
+def compute_attribute_scores_yoloe(
+    visual_feature: torch.Tensor,
+    attribute_embeddings: torch.Tensor,
+    cv4_module,
+    scale_idx: int = 0,
+) -> torch.Tensor:
+    """
+    YOLOE cv4 (BNContrastiveHead)를 사용해서 attribute 템플릿 score 계산
+    
+    Args:
+        visual_feature: [embed_dim] - cv3 output at detection location
+        attribute_embeddings: [K, embed_dim] - K개 attribute 템플릿
+        cv4_module: YOLOEDetect의 cv4[scale_idx]
+        scale_idx: 사용할 scale index
+    
+    Returns:
+        [K] - 각 attribute에 대한 score
+    """
+    # cv4 (BNContrastiveHead) forward 직접 구현
+    # BNContrastiveHead: norm -> logit_scale -> einsum -> bias
+    
+    x = visual_feature.view(1, -1, 1, 1)  # [1, embed_dim, 1, 1]
+    w = attribute_embeddings  # [K, embed_dim]
+    
+    # BatchNorm 적용
+    if hasattr(cv4_module, 'norm'):
+        x = cv4_module.norm(x)
+    
+    # L2 정규화 (text embedding)
+    w = F.normalize(w, dim=-1, p=2)
+    
+    # logit_scale 적용
+    if hasattr(cv4_module, 'logit_scale'):
+        x = x * cv4_module.logit_scale.exp()
+    
+    # einsum: [1, embed_dim, 1, 1] x [K, embed_dim] -> [1, K, 1, 1]
+    scores = torch.einsum('bchw,nc->bnhw', x, w)
+    
+    # bias 적용
+    if hasattr(cv4_module, 'bias'):
+        scores = scores + cv4_module.bias
+    
+    return scores.squeeze()  # [K]
+
+
 def compute_view_posterior(region_feature: np.ndarray,
                           view_embeddings: np.ndarray,
                           temperature: float = 1.0) -> np.ndarray:
@@ -277,12 +322,14 @@ class SemanticUncertaintyCalculator:
     """
     Semantic Uncertainty 계산기
     
-    Detection 리스트에 대해 u_sem을 일괄 계산
+    YOLOE의 cv4를 사용해서 attribute 템플릿 score를 계산하고
+    이 score들의 JS divergence로 u_sem 계산
     """
     
     def __init__(self,
                  attribute_cache: AttributeEmbeddingCache,
                  class_names: Dict[int, str],
+                 model = None,
                  top_m: int = 10,
                  temperature: float = 1.0,
                  device: str = "cuda"):
@@ -290,36 +337,51 @@ class SemanticUncertaintyCalculator:
         Args:
             attribute_cache: Attribute embedding 캐시
             class_names: 클래스 이름 딕셔너리
+            model: YOLOE 모델 (cv4 접근용)
             top_m: Top-M 클래스 게이팅
             temperature: softmax temperature
             device: 디바이스
         """
         self.attribute_cache = attribute_cache
         self.class_names = class_names
+        self.model = model
         self.top_m = top_m
         self.temperature = temperature
         self.device = device
         
-        # 전체 클래스의 view embeddings 준비
+        # cv4 모듈 참조 (YOLOE head)
+        self.cv4 = None
+        if model is not None:
+            head = model.model.model[-1]
+            self.cv4 = head.cv4  # ModuleList of BNContrastiveHead
+        
+        # 클래스별 attribute view embeddings를 tensor로 준비
+        # {class_idx: [K, embed_dim]}
+        self.class_view_embeddings = {}
+        for class_idx in class_names.keys():
+            if class_idx in attribute_cache.cache:
+                views = attribute_cache.cache[class_idx]
+                # [K, embed_dim]
+                emb = np.stack([views.view_embeddings[k] for k in range(len(views.view_embeddings))])
+                self.class_view_embeddings[class_idx] = torch.from_numpy(emb).float().to(device)
+        
+        # Legacy: 기존 방식 호환용
         self.all_class_indices = sorted(class_names.keys())
         self.view_embeddings = get_view_embeddings_for_classes(
             attribute_cache, self.all_class_indices
         )  # [num_classes, K, embed_dim]
-        
-        # 인덱스 매핑
         self.idx_to_pos = {idx: pos for pos, idx in enumerate(self.all_class_indices)}
-        
-        # YOLOE visual feature 사용 (CLIP은 더 이상 필요없음)
-        self.clip_model = None
-        self.clip_preprocess = None
     
     def compute_for_detection(self, detection: Detection, use_gating: bool = True) -> float:
         """
         단일 detection의 u_sem 계산
         
+        YOLOE cv4를 사용해서 각 attribute 템플릿에 대한 score를 계산하고
+        이 score들의 JS divergence로 u_sem 반환
+        
         Args:
             detection: Detection 객체
-            use_gating: Top-M 게이팅 사용 여부
+            use_gating: (미사용, 호환성용)
         
         Returns:
             u_sem 값
@@ -327,24 +389,51 @@ class SemanticUncertaintyCalculator:
         if detection.region_feature is None:
             return 0.0
         
-        if use_gating and detection.top_k_classes is not None:
-            # Top-M 게이팅
-            top_m_classes = detection.top_k_classes[:self.top_m]
-            # 인덱스 변환 (클래스 인덱스 -> 배열 위치)
-            top_m_positions = [self.idx_to_pos.get(c, 0) for c in top_m_classes]
-            return compute_u_sem_gated(
-                detection.region_feature,
-                self.view_embeddings,
-                np.array(top_m_positions),
-                self.temperature
-            )
+        # 예측된 클래스의 attribute embeddings 가져오기
+        pred_class = detection.pred_class
+        if pred_class not in self.class_view_embeddings:
+            return 0.0
+        
+        attr_embeddings = self.class_view_embeddings[pred_class]  # [K, embed_dim]
+        K = attr_embeddings.shape[0]
+        
+        # Visual feature를 tensor로 변환
+        if isinstance(detection.region_feature, np.ndarray):
+            visual_feat = torch.from_numpy(detection.region_feature).float().to(self.device)
         else:
-            # 전체 클래스 대상
-            return compute_u_sem(
-                detection.region_feature,
-                self.view_embeddings,
-                self.temperature
+            visual_feat = detection.region_feature.to(self.device)
+        
+        # cv4가 있으면 cv4를 사용해서 정확한 score 계산
+        if self.cv4 is not None:
+            # cv4[0] 사용 (scale 0)
+            scores = compute_attribute_scores_yoloe(
+                visual_feat, attr_embeddings, self.cv4[0]
             )
+            scores = scores.detach().cpu().numpy()
+        else:
+            # Fallback: 단순 dot product
+            visual_feat_np = visual_feat.cpu().numpy()
+            visual_feat_np = visual_feat_np / (np.linalg.norm(visual_feat_np) + 1e-10)
+            attr_emb_np = attr_embeddings.cpu().numpy()
+            scores = np.dot(attr_emb_np, visual_feat_np)
+        
+        # 각 attribute view를 별도의 "class"로 취급해서 JS divergence 계산
+        # score -> softmax -> posterior
+        # 여기서는 단일 클래스에 대한 K개 view의 score 분포를 비교
+        # JS divergence of K distributions (각 view에서의 score를 확률로 변환)
+        
+        # 방법 1: 각 view의 score를 확률로 변환 (softmax)
+        # K개 view에서 동일 클래스에 대한 score의 분산을 측정
+        posteriors = []
+        for k in range(K):
+            # 각 view의 score를 2-class 분포로 변환 (해당 attribute vs not)
+            # score가 높으면 해당 attribute가 맞음
+            s = scores[k]
+            p = softmax(np.array([s, 0]) / self.temperature)  # [p(attr), p(not attr)]
+            posteriors.append(p)
+        
+        posteriors = np.stack(posteriors, axis=0)  # [K, 2]
+        return js_divergence(posteriors)
     
     def compute_for_detection_with_image(self, 
                                           detection: Detection,

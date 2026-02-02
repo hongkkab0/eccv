@@ -511,10 +511,14 @@ def run_evaluation_phase(config: ExperimentConfig,
                          logger: DetectionLogger,
                          attribute_cache: AttributeEmbeddingCache,
                          class_names: dict,
+                         model,
                          output_dir: Path,
                          verbose: bool = False):
     """
     Phase 3: Confidence matching, u_sem 계산, H1 검증
+    
+    Args:
+        model: YOLOE 모델 (cv4 접근용)
     """
     print("\n" + "="*60)
     print("Phase 3: Evaluation")
@@ -551,11 +555,12 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (YOLOE visual feature 사용)
-    print("\n--- Semantic Uncertainty Calculation (YOLOE visual features) ---")
+    # 3.3 u_sem 계산 (YOLOE cv4 사용)
+    print("\n--- Semantic Uncertainty Calculation (YOLOE cv4 scores) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
         attribute_cache=attribute_cache,
         class_names=class_names,
+        model=model,  # cv4 접근용
         top_m=config.top_m_classes,
         device=config.device,
     )
@@ -787,14 +792,14 @@ def main():
         }
         json.dump(report_serializable, f, indent=2)
     
+    # 모델 로드 (Phase 1 & Phase 3에서 필요)
+    print("\n--- Loading YOLO-E Model ---")
+    model = YOLOE(config.checkpoint)
+    model.to(config.device)
+    model.eval()
+    
     # Phase 1: Detection
     if not args.skip_detection:
-        # 모델 로드
-        print("\n--- Loading YOLO-E Model ---")
-        model = YOLOE(config.checkpoint)
-        model.to(config.device)
-        model.eval()
-        
         logger = run_detection_phase(
             config, model, class_names, confounder_indices,
             gt_to_model_idx=gt_to_model_idx,
@@ -830,7 +835,7 @@ def main():
     
     # Phase 3: Evaluation
     h1_result = run_evaluation_phase(
-        config, logger, attribute_cache, class_names, output_dir,
+        config, logger, attribute_cache, class_names, model, output_dir,
         verbose=args.verbose,
     )
     
