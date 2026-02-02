@@ -35,8 +35,8 @@ class ExperimentConfig:
     conf_bin_start: float = 0.25  # conf_threshold부터 시작
     conf_bin_end: float = 0.95
     conf_bin_step: float = 0.10   # 더 넓은 bin
-    samples_per_bin: int = 20     # 각 bin에서 그룹별 샘플링 수
-    min_samples_per_bin: int = 5  # bin당 최소 샘플 수
+    samples_per_bin: int = 200    # 각 bin에서 그룹별 샘플링 수 (100→200, 총 ~1000+)
+    min_samples_per_bin: int = 10 # bin당 최소 샘플 수
     
     # === A-4: H1 검증 설정 ===
     top_m_classes: int = 10  # Top-M 클래스 게이팅

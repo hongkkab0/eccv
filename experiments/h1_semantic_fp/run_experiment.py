@@ -691,17 +691,27 @@ def run_evaluation_phase(config: ExperimentConfig,
         u_sems = u_sem_by_group[group]
         u_sem_conds = u_sem_cond_by_group[group]
         u_gts = u_gt_by_group[group]
+        
+        # u_sem, u_sem_cond: 0보다 큰 것만
         valid_mask = ~np.isnan(u_sems) & (u_sems > 0)
         valid_u = u_sems[valid_mask]
         valid_u_cond = u_sem_conds[valid_mask]
-        valid_u_gt = u_gts[valid_mask]
+        
+        # u_gt: NaN이 아닌 것만 (Background_FP는 NaN)
+        valid_u_gt_mask = ~np.isnan(u_gts)
+        valid_u_gt = u_gts[valid_u_gt_mask]
+        
+        print(f"    {group}:")
         if len(valid_u) > 0:
-            print(f"    {group}:")
-            print(f"      u_sem:      mean={valid_u.mean():.4f}, std={valid_u.std():.4f}")
+            print(f"      u_sem:      mean={valid_u.mean():.4f}, std={valid_u.std():.4f}, n={len(valid_u)}")
             print(f"      u_sem_cond: mean={valid_u_cond.mean():.4f}, std={valid_u_cond.std():.4f}")
-            print(f"      u_gt:       mean={valid_u_gt.mean():.4f}, std={valid_u_gt.std():.4f}")
         else:
-            print(f"    {group}: no valid samples (total={len(u_sems)})")
+            print(f"      u_sem/u_sem_cond: no valid samples (total={len(u_sems)})")
+        
+        if len(valid_u_gt) > 0:
+            print(f"      u_gt:       mean={valid_u_gt.mean():.4f}, std={valid_u_gt.std():.4f}, n={len(valid_u_gt)}")
+        else:
+            print(f"      u_gt:       N/A (no GT, e.g. Background_FP)")
     
     # 3.4 Enhanced Triad Split (artifactness score 기반)
     print("\n--- Enhanced Triad Split (artifactness-based) ---")
@@ -818,60 +828,136 @@ def run_evaluation_phase(config: ExperimentConfig,
         )
         print(format_h1_results(h1_result_u_gt))
     
-    # A-3) Hard-negative FP만: TP vs HardNegative_FP (핵심 가설 검증)
+    # A-3) Hard-negative FP: u_sem 기반 (기존)
+    h1_result_hard_neg_u_sem = None
     if len(split_groups.get("HardNegative_FP", [])) >= 10:
-        print("\n  [A-3] TP vs HardNegative_FP (진짜 semantic error):")
+        print("\n  [A-3] TP vs HardNegative_FP (u_sem):")
         hard_neg_dets = [det for det, _ in split_groups["HardNegative_FP"]]
         hard_neg_u_sems = np.array([u for _, u in split_groups["HardNegative_FP"]])
+        hard_neg_confs = np.array([d.confidence for d in hard_neg_dets])
         
-        # TP와 비교
+        # TP와 비교 (confidence matching 재수행!)
+        tp_dets = matched_data.get("TP", [])
         tp_u = u_sem_by_group.get("TP", np.array([]))
+        tp_confs = np.array([d.confidence for d in tp_dets])
         
         if len(tp_u) >= 10:
-            h1_result_hard_neg = evaluator.evaluate(
-                u_sem_tp=tp_u,
-                u_sem_semantic_fp=hard_neg_u_sems,
-                confidence_tp=conf_tp,
-                confidence_semantic_fp=np.array([d.confidence for d in hard_neg_dets]),
+            # TP vs HardNeg 전용 confidence matching
+            from .confidence_matching import match_confidence_distributions
+            tp_idx, hn_idx = match_confidence_distributions(tp_confs, hard_neg_confs, n_bins=7)
+            
+            tp_u_matched = tp_u[tp_idx]
+            hn_u_matched = hard_neg_u_sems[hn_idx]
+            tp_conf_matched = tp_confs[tp_idx]
+            hn_conf_matched = hard_neg_confs[hn_idx]
+            
+            print(f"      Confidence-matched: TP n={len(tp_idx)}, HardNeg n={len(hn_idx)}")
+            
+            h1_result_hard_neg_u_sem = evaluator.evaluate(
+                u_sem_tp=tp_u_matched,
+                u_sem_semantic_fp=hn_u_matched,
+                confidence_tp=tp_conf_matched,
+                confidence_semantic_fp=hn_conf_matched,
             )
-            print(format_h1_results(h1_result_hard_neg))
+            print(format_h1_results(h1_result_hard_neg_u_sem))
         else:
             print("      TP 샘플 부족")
     else:
         print(f"\n  [A-3] HardNegative_FP 샘플 부족 ({len(split_groups.get('HardNegative_FP', []))}개)")
     
-    # B) 새로운: TP vs Depiction_FP (H1 핵심 대상)
-    if "TP" in enhanced_u_sem and "Depiction_FP" in enhanced_u_sem:
-        tp_u = enhanced_u_sem["TP"]
-        dep_u = enhanced_u_sem["Depiction_FP"]
+    # A-4) ★ 핵심: TP vs HardNegative_FP (u_gt)
+    h1_result_hard_neg_u_gt = None
+    if len(split_groups.get("HardNegative_FP", [])) >= 10:
+        print("\n  [A-4] TP vs HardNegative_FP (u_gt) ★ H1 핵심:")
         
-        # 유효한 샘플만
-        tp_valid = tp_u[tp_u > 0]
-        dep_valid = dep_u[dep_u > 0]
+        # HardNegative의 u_gt 계산 (detection에서 직접)
+        hard_neg_dets = [det for det, _ in split_groups["HardNegative_FP"]]
+        hard_neg_confs = np.array([d.confidence for d in hard_neg_dets])
         
-        print(f"\n  [B] TP vs Depiction_FP (H1 핵심 대상):")
-        print(f"      TP: n={len(tp_valid)}, mean_u_sem={tp_valid.mean():.4f}" if len(tp_valid) > 0 else "      TP: n=0")
-        print(f"      Depiction_FP: n={len(dep_valid)}, mean_u_sem={dep_valid.mean():.4f}" if len(dep_valid) > 0 else "      Depiction_FP: n=0")
+        # u_gt 재계산 (split_groups에는 u_sem만 있음)
+        hard_neg_u_gts = []
+        for det in hard_neg_dets:
+            # Semantic_FP의 원래 인덱스 찾기
+            if "Semantic_FP" in matched_data:
+                try:
+                    idx = matched_data["Semantic_FP"].index(det)
+                    hard_neg_u_gts.append(u_gt_by_group["Semantic_FP"][idx])
+                except (ValueError, KeyError, IndexError):
+                    hard_neg_u_gts.append(0.0)
+            else:
+                hard_neg_u_gts.append(0.0)
+        hard_neg_u_gts = np.array(hard_neg_u_gts)
         
-        if len(tp_valid) >= 10 and len(dep_valid) >= 10:
-            conf_tp_dep = np.array([d.confidence for d in enhanced_detections.get("TP", [])])
-            conf_dep_fp = np.array([d.confidence for d in enhanced_detections.get("Depiction_FP", [])])
+        tp_dets = matched_data.get("TP", [])
+        tp_u_gt = u_gt_by_group.get("TP", np.array([]))
+        tp_confs = np.array([d.confidence for d in tp_dets])
+        
+        if len(tp_u_gt) >= 10:
+            # TP vs HardNeg 전용 confidence matching
+            from .confidence_matching import match_confidence_distributions
+            tp_idx, hn_idx = match_confidence_distributions(tp_confs, hard_neg_confs, n_bins=7)
             
-            # 유효한 것만
-            conf_tp_dep = conf_tp_dep[:len(tp_valid)]
-            conf_dep_fp = conf_dep_fp[:len(dep_valid)]
+            tp_u_gt_matched = tp_u_gt[tp_idx]
+            hn_u_gt_matched = hard_neg_u_gts[hn_idx]
+            tp_conf_matched = tp_confs[tp_idx]
+            hn_conf_matched = hard_neg_confs[hn_idx]
             
-            h1_result_depiction = evaluator.evaluate(
-                u_sem_tp=tp_valid,
-                u_sem_semantic_fp=dep_valid,
-                confidence_tp=conf_tp_dep,
-                confidence_semantic_fp=conf_dep_fp,
+            print(f"      Confidence-matched: TP n={len(tp_idx)}, HardNeg n={len(hn_idx)}")
+            print(f"      u_gt mean: TP={tp_u_gt_matched.mean():.4f}, HardNeg={hn_u_gt_matched.mean():.4f}")
+            
+            h1_result_hard_neg_u_gt = evaluator.evaluate(
+                u_sem_tp=tp_u_gt_matched,
+                u_sem_semantic_fp=hn_u_gt_matched,
+                confidence_tp=tp_conf_matched,
+                confidence_semantic_fp=hn_conf_matched,
             )
-            print(format_h1_results(h1_result_depiction))
+            print(format_h1_results(h1_result_hard_neg_u_gt))
         else:
-            print("      → 샘플 부족으로 AUROC 계산 불가 (최소 10개 필요)")
-    else:
-        print("\n  [B] Depiction_FP가 없어서 H1 핵심 검증 불가")
+            print("      TP 샘플 부족")
+    
+    # A-5) NearMiss vs HardNegative: u_gt 평균 차이
+    if len(split_groups.get("NearMiss_FP", [])) >= 10 and len(split_groups.get("HardNegative_FP", [])) >= 10:
+        print("\n  [A-5] NearMiss vs HardNegative (u_gt 비교):")
+        
+        near_miss_dets = [det for det, _ in split_groups["NearMiss_FP"]]
+        hard_neg_dets = [det for det, _ in split_groups["HardNegative_FP"]]
+        
+        # u_gt 재계산
+        near_miss_u_gts = []
+        for det in near_miss_dets:
+            if "Semantic_FP" in matched_data:
+                try:
+                    idx = matched_data["Semantic_FP"].index(det)
+                    near_miss_u_gts.append(u_gt_by_group["Semantic_FP"][idx])
+                except (ValueError, KeyError, IndexError):
+                    near_miss_u_gts.append(0.0)
+            else:
+                near_miss_u_gts.append(0.0)
+        near_miss_u_gts = np.array(near_miss_u_gts)
+        
+        hard_neg_u_gts = []
+        for det in hard_neg_dets:
+            if "Semantic_FP" in matched_data:
+                try:
+                    idx = matched_data["Semantic_FP"].index(det)
+                    hard_neg_u_gts.append(u_gt_by_group["Semantic_FP"][idx])
+                except (ValueError, KeyError, IndexError):
+                    hard_neg_u_gts.append(0.0)
+            else:
+                hard_neg_u_gts.append(0.0)
+        hard_neg_u_gts = np.array(hard_neg_u_gts)
+        
+        print(f"      NearMiss u_gt: mean={near_miss_u_gts.mean():.4f}, std={near_miss_u_gts.std():.4f}, n={len(near_miss_u_gts)}")
+        print(f"      HardNeg u_gt:  mean={hard_neg_u_gts.mean():.4f}, std={hard_neg_u_gts.std():.4f}, n={len(hard_neg_u_gts)}")
+        
+        # Cohen's d
+        pooled_std = np.sqrt((near_miss_u_gts.std()**2 + hard_neg_u_gts.std()**2) / 2)
+        if pooled_std > 0:
+            d = (hard_neg_u_gts.mean() - near_miss_u_gts.mean()) / pooled_std
+            print(f"      Cohen's d (HardNeg - NearMiss): {d:.4f}")
+    
+    # B) Depiction FP는 이번 트랙에서 버림 (주석 처리)
+    # print("\n  [B] Depiction_FP 분석 생략 (H1 핵심 = u_gt 검증 완료)")
     
     # 3.7 결과 저장
     print("\n--- Saving Results ---")
@@ -917,15 +1003,28 @@ def run_evaluation_phase(config: ExperimentConfig,
             "n_semantic_fp": h1_result.n_semantic_fp,
         }
     
-    if h1_result_depiction:
-        results["h1_result_depiction_fp"] = {
-            "auroc_u_sem": h1_result_depiction.auroc_u_sem,
-            "aupr_u_sem": h1_result_depiction.aupr_u_sem,
-            "auroc_confidence": h1_result_depiction.auroc_confidence,
-            "cohens_d_u_sem": h1_result_depiction.cohens_d_u_sem,
-            "n_tp": h1_result_depiction.n_tp,
-            "n_depiction_fp": h1_result_depiction.n_semantic_fp,
+    if h1_result_u_gt:
+        results["h1_result_semantic_fp_u_gt"] = {
+            "auroc_u_gt": h1_result_u_gt.auroc_u_sem,  # u_gt를 u_sem 슬롯에 넣음
+            "aupr_u_gt": h1_result_u_gt.aupr_u_sem,
+            "auroc_confidence": h1_result_u_gt.auroc_confidence,
+            "cohens_d_u_gt": h1_result_u_gt.cohens_d_u_sem,
+            "n_tp": h1_result_u_gt.n_tp,
+            "n_semantic_fp": h1_result_u_gt.n_semantic_fp,
         }
+    
+    # ★ H1 핵심: TP vs HardNegative_FP (u_gt)
+    if h1_result_hard_neg_u_gt:
+        results["h1_result_hard_neg_u_gt"] = {
+            "auroc_u_gt": h1_result_hard_neg_u_gt.auroc_u_sem,
+            "aupr_u_gt": h1_result_hard_neg_u_gt.aupr_u_sem,
+            "auroc_confidence": h1_result_hard_neg_u_gt.auroc_confidence,
+            "cohens_d_u_gt": h1_result_hard_neg_u_gt.cohens_d_u_sem,
+            "n_tp": h1_result_hard_neg_u_gt.n_tp,
+            "n_hard_neg_fp": h1_result_hard_neg_u_gt.n_semantic_fp,
+        }
+    
+    # Depiction FP는 이번 트랙에서 제외
     
     with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
@@ -939,23 +1038,27 @@ def run_evaluation_phase(config: ExperimentConfig,
             if items:
                 confidence_data[group_name] = np.array([det.confidence for det, _ in items])
         
-        auroc = h1_result_depiction.auroc_u_sem if h1_result_depiction else (h1_result.auroc_u_sem if h1_result else 0.5)
+        # ★ H1 핵심: u_gt 기반 AUROC 사용
+        auroc = h1_result_hard_neg_u_gt.auroc_u_sem if h1_result_hard_neg_u_gt else (
+            h1_result_u_gt.auroc_u_sem if h1_result_u_gt else (
+                h1_result.auroc_u_sem if h1_result else 0.5
+            )
+        )
         
-        # ROC data (TP vs Depiction_FP 우선)
-        if "TP" in enhanced_u_sem and "Depiction_FP" in enhanced_u_sem:
-            tp_u = enhanced_u_sem["TP"][enhanced_u_sem["TP"] > 0]
-            dep_u = enhanced_u_sem["Depiction_FP"][enhanced_u_sem["Depiction_FP"] > 0]
-            if len(tp_u) > 0 and len(dep_u) > 0:
-                roc_data = evaluator.get_roc_curve_data(tp_u, dep_u)
-            else:
-                roc_data = None
-        else:
-            roc_data = None
+        # ROC data: TP vs Semantic_FP (u_gt 기반)
+        roc_data = None
+        if "TP" in u_gt_by_group and "Semantic_FP" in u_gt_by_group:
+            tp_u_gt = u_gt_by_group["TP"]
+            sem_u_gt = u_gt_by_group["Semantic_FP"]
+            tp_valid = tp_u_gt[~np.isnan(tp_u_gt)]
+            sem_valid = sem_u_gt[~np.isnan(sem_u_gt)]
+            if len(tp_valid) > 0 and len(sem_valid) > 0:
+                roc_data = evaluator.get_roc_curve_data(tp_valid, sem_valid)
         
         save_all_figures(
             output_dir / "figures",
             confidence_data,
-            enhanced_u_sem,
+            enhanced_u_sem,  # 기존 u_sem도 시각화용으로 유지
             roc_data,
             auroc,
             logger.get_stats(),

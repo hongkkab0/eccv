@@ -237,3 +237,57 @@ def create_confidence_matched_dataset(
     verification = sampler.verify_matching(matched_samples)
     
     return pooled, verification
+
+
+def match_confidence_distributions(
+    conf_a: np.ndarray,
+    conf_b: np.ndarray,
+    n_bins: int = 7,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    두 그룹의 confidence 분포를 매칭하여 인덱스 반환
+    
+    각 bin에서 두 그룹 모두에서 동일 개수만큼 샘플링하여
+    confidence 분포가 동일하게 만듦
+    
+    Args:
+        conf_a: 그룹 A의 confidence 배열
+        conf_b: 그룹 B의 confidence 배열
+        n_bins: bin 개수
+        seed: 랜덤 시드
+    
+    Returns:
+        (indices_a, indices_b): 매칭된 인덱스 배열
+    """
+    np.random.seed(seed)
+    
+    # bin 경계 설정
+    all_conf = np.concatenate([conf_a, conf_b])
+    bin_edges = np.linspace(all_conf.min(), all_conf.max() + 1e-6, n_bins + 1)
+    
+    indices_a = []
+    indices_b = []
+    
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        
+        # 각 bin에 속하는 인덱스
+        mask_a = (conf_a >= lo) & (conf_a < hi)
+        mask_b = (conf_b >= lo) & (conf_b < hi)
+        
+        idx_a = np.where(mask_a)[0]
+        idx_b = np.where(mask_b)[0]
+        
+        # 두 그룹 중 작은 쪽에 맞춤
+        n_samples = min(len(idx_a), len(idx_b))
+        
+        if n_samples > 0:
+            # 랜덤 샘플링
+            sampled_a = np.random.choice(idx_a, n_samples, replace=False)
+            sampled_b = np.random.choice(idx_b, n_samples, replace=False)
+            
+            indices_a.extend(sampled_a.tolist())
+            indices_b.extend(sampled_b.tolist())
+    
+    return np.array(indices_a), np.array(indices_b)

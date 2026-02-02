@@ -606,6 +606,7 @@ class SemanticUncertaintyCalculator:
         debug_info = {"status": "ok", "source": "none"}
         
         # GT class 결정 (Semantic FP의 경우 overlapping GT)
+        # Background_FP는 GT가 없으므로 gt_class = -1 유지 → u_gt = NaN
         gt_class = -1
         if detection.is_tp and detection.matched_gt_class is not None:
             gt_class = detection.matched_gt_class
@@ -614,17 +615,24 @@ class SemanticUncertaintyCalculator:
         elif detection.matched_gt_class is not None:
             gt_class = detection.matched_gt_class
         
+        # Background_FP 여부 확인 (GT 없음)
+        is_background = (detection.matched_gt_idx is None and 
+                         detection.overlapping_gt_class is None and 
+                         not detection.is_tp)
+        
         # 1. region_feature + cls_logits (best: 캘리브레이션된 스케일)
         if detection.region_feature is not None and detection.cls_logits is not None:
             feat = detection.region_feature
             logits = detection.cls_logits
             u_sem = self.compute_u_sem(feat, logits)
             u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, logits)
-            u_gt = self.compute_u_gt(feat, gt_class, logits) if gt_class >= 0 else 0.0
+            # Background_FP는 u_gt = NaN (GT 없음)
+            u_gt = np.nan if is_background else (self.compute_u_gt(feat, gt_class, logits) if gt_class >= 0 else np.nan)
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature+cls_logits"
             debug_info["pred_class"] = pred_cls
             debug_info["gt_class"] = gt_class
+            debug_info["is_background"] = is_background
             return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 2. region_feature만 (cls_logits 없음)
@@ -632,24 +640,26 @@ class SemanticUncertaintyCalculator:
             feat = detection.region_feature
             u_sem = self.compute_u_sem(feat, None)
             u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, None)
-            u_gt = self.compute_u_gt(feat, gt_class, None) if gt_class >= 0 else 0.0
+            u_gt = np.nan if is_background else (self.compute_u_gt(feat, gt_class, None) if gt_class >= 0 else np.nan)
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature"
             debug_info["pred_class"] = pred_cls
             debug_info["gt_class"] = gt_class
+            debug_info["is_background"] = is_background
             return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 3. cls_logits만 있으면 (fused 모델)
         if detection.cls_logits is not None:
             u_sem = self.compute_u_sem_from_logits(detection.cls_logits)
             u_sem_cond = u_sem  # fallback: 같은 값 사용
-            u_gt = 0.0  # fused 모델에서는 u_gt 계산 불가
+            u_gt = np.nan  # fused 모델에서는 u_gt 계산 불가
             s_art = 0.0  # fused 모델에서는 artifactness 계산 불가
             debug_info["source"] = "cls_logits"
+            debug_info["is_background"] = is_background
             return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 4. 둘 다 없으면 drop
-        return 0.0, 0.0, 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
+        return 0.0, 0.0, np.nan, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
     
     def compute_for_detections(self, detections: List[Detection], 
                                verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
