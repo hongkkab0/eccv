@@ -199,46 +199,37 @@ def js_divergence(distributions: np.ndarray, weights: Optional[np.ndarray] = Non
 def compute_attribute_scores_yoloe(
     visual_feature: torch.Tensor,
     attribute_embeddings: torch.Tensor,
-    cv4_module,
+    cv4_module=None,
     scale_idx: int = 0,
 ) -> torch.Tensor:
     """
-    YOLOE cv4 (BNContrastiveHead)를 사용해서 attribute 템플릿 score 계산
+    Attribute 템플릿 score 계산 (visual feature와 text embedding의 similarity)
     
     Args:
         visual_feature: [embed_dim] - cv3 output at detection location
         attribute_embeddings: [K, embed_dim] - K개 attribute 템플릿
-        cv4_module: YOLOEDetect의 cv4[scale_idx]
+        cv4_module: (optional) YOLOEDetect의 cv4[scale_idx] - logit_scale 사용
         scale_idx: 사용할 scale index
     
     Returns:
         [K] - 각 attribute에 대한 score
     """
-    # cv4 (BNContrastiveHead) forward 직접 구현
-    # BNContrastiveHead: norm -> logit_scale -> einsum -> bias
+    # L2 정규화
+    v = F.normalize(visual_feature.view(-1), dim=0, p=2)  # [embed_dim]
+    w = F.normalize(attribute_embeddings, dim=-1, p=2)    # [K, embed_dim]
     
-    x = visual_feature.view(1, -1, 1, 1)  # [1, embed_dim, 1, 1]
-    w = attribute_embeddings  # [K, embed_dim]
+    # Cosine similarity (dot product of normalized vectors)
+    scores = torch.mv(w, v)  # [K]
     
-    # BatchNorm 적용
-    if hasattr(cv4_module, 'norm'):
-        x = cv4_module.norm(x)
+    # logit_scale 적용 (cv4에서 가져오기, 없으면 기본값 사용)
+    if cv4_module is not None and hasattr(cv4_module, 'logit_scale'):
+        logit_scale = cv4_module.logit_scale.exp()
+        scores = scores * logit_scale
+    else:
+        # CLIP/MobileCLIP 기본 logit_scale ≈ 100
+        scores = scores * 100.0
     
-    # L2 정규화 (text embedding)
-    w = F.normalize(w, dim=-1, p=2)
-    
-    # logit_scale 적용
-    if hasattr(cv4_module, 'logit_scale'):
-        x = x * cv4_module.logit_scale.exp()
-    
-    # einsum: [1, embed_dim, 1, 1] x [K, embed_dim] -> [1, K, 1, 1]
-    scores = torch.einsum('bchw,nc->bnhw', x, w)
-    
-    # bias 적용
-    if hasattr(cv4_module, 'bias'):
-        scores = scores + cv4_module.bias
-    
-    return scores.squeeze()  # [K]
+    return scores  # [K]
 
 
 def compute_view_posterior(region_feature: np.ndarray,
