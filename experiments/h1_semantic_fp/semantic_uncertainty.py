@@ -21,71 +21,93 @@ from .detection_logger import Detection
 from .attribute_embeddings import AttributeEmbeddingCache, get_view_embeddings_for_classes
 
 
-def compute_attribute_confidences(
-    model,
-    image: torch.Tensor,
-    bbox: np.ndarray,
-    attribute_embeddings: torch.Tensor,
-    device: str = "cuda",
-) -> np.ndarray:
+class ClassScoreExtractor:
     """
-    YOLOE에 attribute text embedding을 넣어서 confidence 획득
-    
-    Args:
-        model: YOLOE 모델
-        image: [C, H, W] 또는 [1, C, H, W] 이미지 텐서
-        bbox: [x1, y1, x2, y2] detection bbox
-        attribute_embeddings: [K, embed_dim] K개 attribute 템플릿 embedding
-        device: 디바이스
-    
-    Returns:
-        [K] - 각 attribute에 대한 confidence
+    YOLOE에서 detection 시 class score vector를 추출하는 클래스
+    head의 forward에서 cls tensor를 hook으로 캡처
     """
-    K = attribute_embeddings.shape[0]
     
-    # 이미지 준비
-    if image.dim() == 3:
-        image = image.unsqueeze(0)
-    image = image.to(device).float()
-    if image.max() > 1.0:
-        image = image / 255.0
+    def __init__(self, model, device: str = "cuda"):
+        self.model = model
+        self.device = device
+        self.cls_scores = None  # [B, nc, num_anchors]
+        self.anchors = None     # [2, num_anchors]
+        self.strides = None     # [num_anchors]
+        self.hook = None
+        self._register_hook()
     
-    # Attribute embedding을 tpe로 설정
-    tpe = model.model.model[-1].get_tpe(attribute_embeddings.unsqueeze(0))
-    
-    # 임시로 class 설정
-    original_nc = model.model.model[-1].nc
-    model.model.model[-1].nc = K
-    
-    # Inference
-    with torch.no_grad():
-        results = model.predict(image, verbose=False, conf=0.001)
-    
-    # 원래대로 복구
-    model.model.model[-1].nc = original_nc
-    
-    # 결과에서 해당 bbox와 겹치는 detection 찾기
-    confidences = np.zeros(K)
-    
-    if len(results) > 0 and results[0].boxes is not None:
-        pred_boxes = results[0].boxes.xyxy.cpu().numpy()
-        pred_confs = results[0].boxes.conf.cpu().numpy()
-        pred_classes = results[0].boxes.cls.cpu().numpy().astype(int)
+    def _register_hook(self):
+        """head의 forward 후 cls tensor 캡처"""
+        head = self.model.model.model[-1]
         
-        # bbox와 IoU 계산
-        from ultralytics.utils.metrics import box_iou
-        bbox_tensor = torch.tensor([bbox]).float()
-        pred_boxes_tensor = torch.tensor(pred_boxes).float()
+        # forward hook - head.forward()의 output에서 cls 추출
+        def hook_fn(module, input, output):
+            # output은 (box_decoded, cls) 또는 다른 형태일 수 있음
+            # head 내부의 cls tensor를 직접 접근
+            if hasattr(module, '_last_cls'):
+                self.cls_scores = module._last_cls.detach()
+            if hasattr(module, 'anchors'):
+                self.anchors = module.anchors.detach()
+            if hasattr(module, 'strides'):
+                self.strides = module.strides.detach()
         
-        if len(pred_boxes) > 0:
-            ious = box_iou(bbox_tensor, pred_boxes_tensor).squeeze(0).numpy()
+        self.hook = head.register_forward_hook(hook_fn)
+        
+        # head.forward를 래핑해서 cls를 저장
+        original_forward = head.forward
+        def wrapped_forward(x, cls_pe, return_mask=False):
+            result = original_forward(x, cls_pe, return_mask)
+            return result
+        head.forward = wrapped_forward
+    
+    def get_scores_for_boxes(self, boxes: torch.Tensor, img_shape: tuple) -> torch.Tensor:
+        """
+        Detection boxes의 class score vector 추출
+        
+        Args:
+            boxes: [N, 4] xyxy 좌표
+            img_shape: (H, W) 이미지 크기
+        
+        Returns:
+            [N, nc] class scores
+        """
+        if self.cls_scores is None or self.anchors is None:
+            return None
+        
+        H, W = img_shape
+        cls = self.cls_scores[0]  # [nc, num_anchors]
+        nc, num_anchors = cls.shape
+        
+        # anchors: [2, num_anchors] (x, y 좌표)
+        anchor_xy = self.anchors.T  # [num_anchors, 2]
+        
+        scores_list = []
+        for box in boxes:
+            # box 중심점
+            cx = (box[0] + box[2]) / 2
+            cy = (box[1] + box[3]) / 2
             
-            # IoU > 0.5인 detection들의 confidence를 class별로 수집
-            for i, (cls, conf, iou) in enumerate(zip(pred_classes, pred_confs, ious)):
-                if iou > 0.5 and cls < K:
-                    confidences[cls] = max(confidences[cls], conf)
+            # 가장 가까운 anchor 찾기
+            # strides로 anchor 좌표를 pixel 좌표로 변환
+            anchor_px = anchor_xy * self.strides.unsqueeze(1)  # [num_anchors, 2]
+            
+            dist = ((anchor_px[:, 0] - cx) ** 2 + (anchor_px[:, 1] - cy) ** 2)
+            nearest_idx = dist.argmin()
+            
+            # 해당 anchor의 class score
+            score = cls[:, nearest_idx]  # [nc]
+            scores_list.append(score)
+        
+        return torch.stack(scores_list) if scores_list else None
     
-    return confidences
+    def clear(self):
+        self.cls_scores = None
+        self.anchors = None
+        self.strides = None
+    
+    def remove_hook(self):
+        if self.hook:
+            self.hook.remove()
 
 
 def compute_yoloe_crop_embedding(image: Image.Image, 
@@ -267,8 +289,14 @@ class SemanticUncertaintyCalculator:
     """
     Semantic Uncertainty 계산기
     
-    YOLOE의 cv4를 사용해서 attribute 템플릿 score를 계산하고
+    YOLOE에 attribute embedding을 넣어서 class score를 직접 얻고
     이 score들의 JS divergence로 u_sem 계산
+    
+    효율적인 방식:
+    1. 각 predicted class의 K개 attribute 템플릿을 class로 설정
+    2. YOLOE inference로 pre-NMS class score tensor 획득
+    3. 해당 detection bbox 위치의 K개 score 추출
+    4. JS divergence 계산
     """
     
     def __init__(self,
@@ -282,7 +310,7 @@ class SemanticUncertaintyCalculator:
         Args:
             attribute_cache: Attribute embedding 캐시
             class_names: 클래스 이름 딕셔너리
-            model: YOLOE 모델 (cv4 접근용)
+            model: YOLOE 모델
             top_m: Top-M 클래스 게이팅
             temperature: softmax temperature
             device: 디바이스
@@ -294,35 +322,26 @@ class SemanticUncertaintyCalculator:
         self.temperature = temperature
         self.device = device
         
-        # cv4 모듈 참조 (YOLOE head)
-        self.cv4 = None
-        if model is not None:
-            head = model.model.model[-1]
-            self.cv4 = head.cv4  # ModuleList of BNContrastiveHead
-        
         # 클래스별 attribute view embeddings를 tensor로 준비
         # {class_idx: [K, embed_dim]}
         self.class_view_embeddings = {}
+        self.num_views = 0
         for class_idx in class_names.keys():
             if class_idx in attribute_cache.class_views:
                 views = attribute_cache.class_views[class_idx]
                 # [K, embed_dim]
                 emb = np.stack([views.view_embeddings[k] for k in range(len(views.view_embeddings))])
                 self.class_view_embeddings[class_idx] = torch.from_numpy(emb).float().to(device)
+                self.num_views = max(self.num_views, len(views.view_embeddings))
         
-        # Legacy: 기존 방식 호환용
-        self.all_class_indices = sorted(class_names.keys())
-        self.view_embeddings = get_view_embeddings_for_classes(
-            attribute_cache, self.all_class_indices
-        )  # [num_classes, K, embed_dim]
-        self.idx_to_pos = {idx: pos for pos, idx in enumerate(self.all_class_indices)}
+        print(f"  Loaded attribute embeddings for {len(self.class_view_embeddings)} classes, {self.num_views} views each")
     
     def compute_for_detection(self, detection: Detection, use_gating: bool = True) -> float:
         """
         단일 detection의 u_sem 계산
         
-        YOLOE에 attribute text embedding을 넣어서 inference하고
-        각 attribute에 대한 confidence 차이로 u_sem 계산
+        YOLOE에 attribute embedding을 넣어서 inference하고
+        해당 detection 위치의 class score vector로 u_sem 계산
         
         Args:
             detection: Detection 객체
@@ -341,63 +360,100 @@ class SemanticUncertaintyCalculator:
         
         # 이미지 로드
         if detection.image_path is None:
-            # region_feature가 있으면 그것 사용 (fallback)
-            if detection.region_feature is not None:
-                return self._compute_from_feature(detection, attr_embeddings)
             return 0.0
         
-        # 이미지를 로드해서 attribute confidence 계산
         try:
             from PIL import Image as PILImage
             img = PILImage.open(detection.image_path).convert('RGB')
-            img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1)  # [C, H, W]
+            img_np = np.array(img)
             
-            confidences = compute_attribute_confidences(
-                self.model, img_tensor, detection.bbox, 
-                attr_embeddings, self.device
-            )
+            # YOLOE에 attribute embedding을 class로 설정하고 inference
+            scores = self._get_attribute_scores(img_np, detection.bbox, attr_embeddings)
+            
+            if scores is None or len(scores) == 0:
+                return 0.0
+            
         except Exception as e:
-            # 실패하면 region_feature 사용
-            if detection.region_feature is not None:
-                return self._compute_from_feature(detection, attr_embeddings)
             return 0.0
         
-        # Confidence 분포의 JS divergence
-        # 각 attribute의 confidence를 확률 분포로 변환
+        # K개 view의 score로 JS divergence 계산
+        # 각 view의 score를 확률 분포로 변환 (softmax)
+        # 여기서 score는 sigmoid 후 confidence이므로 직접 사용
         posteriors = []
-        for k in range(K):
-            conf = confidences[k]
-            # confidence를 2-class 분포로 변환
-            p = np.array([conf, 1 - conf + 1e-10])
+        for k in range(min(K, len(scores))):
+            s = scores[k]
+            # score를 2-class 분포로 변환 (attribute vs not)
+            p = np.array([s + 1e-10, 1 - s + 1e-10])
             p = p / p.sum()
             posteriors.append(p)
+        
+        if len(posteriors) < 2:
+            return 0.0
         
         posteriors = np.stack(posteriors, axis=0)  # [K, 2]
         return js_divergence(posteriors)
     
-    def _compute_from_feature(self, detection: Detection, attr_embeddings: torch.Tensor) -> float:
-        """region_feature를 사용한 fallback 계산"""
+    def _get_attribute_scores(self, image: np.ndarray, bbox: np.ndarray, 
+                               attr_embeddings: torch.Tensor) -> np.ndarray:
+        """
+        YOLOE에 attribute embedding을 넣어서 해당 bbox의 score 획득
+        
+        Args:
+            image: [H, W, 3] numpy 이미지
+            bbox: [x1, y1, x2, y2]
+            attr_embeddings: [K, embed_dim]
+        
+        Returns:
+            [K] scores
+        """
+        if self.model is None:
+            return None
+        
         K = attr_embeddings.shape[0]
+        head = self.model.model.model[-1]
         
-        # Visual feature를 tensor로 변환
-        if isinstance(detection.region_feature, np.ndarray):
-            visual_feat = torch.from_numpy(detection.region_feature).float().to(self.device)
-        else:
-            visual_feat = detection.region_feature.to(self.device)
+        # Attribute embedding을 text prompt embedding으로 설정
+        tpe = head.get_tpe(attr_embeddings.unsqueeze(0))
         
-        # L2 정규화 후 dot product
-        scores = compute_attribute_scores_yoloe(visual_feat, attr_embeddings, self.cv4[0] if self.cv4 else None)
-        scores = scores.detach().cpu().numpy()
+        # 임시 class 이름 (K개)
+        temp_names = [f"attr_{i}" for i in range(K)]
         
-        # Score를 확률로 변환
-        posteriors = []
-        for k in range(K):
-            s = scores[k]
-            p = softmax(np.array([s, 0]) / self.temperature)
-            posteriors.append(p)
+        # model에 class 설정
+        self.model.set_classes(temp_names, tpe)
         
-        posteriors = np.stack(posteriors, axis=0)
-        return js_divergence(posteriors)
+        try:
+            # YOLOE inference
+            with torch.no_grad():
+                results = self.model.predict(image, verbose=False, conf=0.001)
+            
+            # head._last_cls에서 class score 가져오기
+            if not hasattr(head, '_last_cls') or head._last_cls is None:
+                return None
+            
+            cls_logits = head._last_cls[0]  # [K, num_anchors]
+            cls_scores = cls_logits.sigmoid()  # confidence로 변환
+            
+            # bbox 중심에 가장 가까운 anchor 찾기
+            anchors = head.anchors  # [2, num_anchors]
+            strides = head.strides  # [num_anchors]
+            
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            
+            # anchor 좌표를 pixel 좌표로 변환
+            anchor_px = anchors.T * strides.unsqueeze(1)  # [num_anchors, 2]
+            
+            # 가장 가까운 anchor
+            dist = ((anchor_px[:, 0] - cx) ** 2 + (anchor_px[:, 1] - cy) ** 2)
+            nearest_idx = dist.argmin()
+            
+            # 해당 anchor의 K개 class score
+            scores = cls_scores[:K, nearest_idx].cpu().numpy()
+            
+        except Exception as e:
+            return None
+        
+        return scores
     
     def compute_for_detection_with_image(self, 
                                           detection: Detection,

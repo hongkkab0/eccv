@@ -513,6 +513,10 @@ class YOLOEDetect(Detect):
         if has_lrpc:
             mask = torch.cat(masks)
             dbox = dbox[:, :, mask]
+        
+        # class score tensor 저장 (semantic uncertainty 계산용)
+        self._last_cls = cls  # [B, nc, num_anchors] - logits (sigmoid 전)
+        
         y = torch.cat((dbox, cls.sigmoid()), 1)
         
         if not has_lrpc or not return_mask:
