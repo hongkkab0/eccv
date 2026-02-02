@@ -649,8 +649,17 @@ def run_evaluation_phase(config: ExperimentConfig,
                         break
                 break
     
-    # u_sem, artifactness 계산
+    # Global alpha 추정 (안정적인 스케일)
+    print("\n--- Estimating Global Alpha ---")
+    all_dets_for_alpha = []
+    for group_name, detections in matched_data.items():
+        if isinstance(detections, list):
+            all_dets_for_alpha.extend(detections[:500])
+    global_alpha = u_sem_calculator.estimate_global_alpha(all_dets_for_alpha, n_samples=1000)
+    
+    # u_sem, u_sem_cond, artifactness 계산
     u_sem_by_group = {}
+    u_sem_cond_by_group = {}
     s_art_by_group = {}
     drop_stats_by_group = {}
     
@@ -659,7 +668,7 @@ def run_evaluation_phase(config: ExperimentConfig,
             continue
         
         print(f"\n  Computing u_sem for {group_name} ({len(detections)} samples)...")
-        u_sems, s_arts, drop_stats = u_sem_calculator.compute_for_detections(detections, verbose=True)
+        u_sems, u_sem_conds, s_arts, drop_stats = u_sem_calculator.compute_for_detections(detections, verbose=True)
         
         # CRITICAL: valid==0이면 실패
         if drop_stats["valid"] == 0:
@@ -670,17 +679,22 @@ def run_evaluation_phase(config: ExperimentConfig,
             )
         
         u_sem_by_group[group_name] = u_sems
+        u_sem_cond_by_group[group_name] = u_sem_conds
         s_art_by_group[group_name] = s_arts
         drop_stats_by_group[group_name] = drop_stats
     
-    # u_sem 통계
+    # u_sem 통계 (기존 + 조건부)
     print(f"\n  u_sem statistics:")
-    for group, u_sems in u_sem_by_group.items():
+    for group in u_sem_by_group.keys():
+        u_sems = u_sem_by_group[group]
+        u_sem_conds = u_sem_cond_by_group[group]
         valid_mask = ~np.isnan(u_sems) & (u_sems > 0)
         valid_u = u_sems[valid_mask]
+        valid_u_cond = u_sem_conds[valid_mask]
         if len(valid_u) > 0:
-            print(f"    {group}: mean={valid_u.mean():.4f}, std={valid_u.std():.4f}, "
-                  f"min={valid_u.min():.4f}, max={valid_u.max():.4f}, n={len(valid_u)}/{len(u_sems)}")
+            print(f"    {group}:")
+            print(f"      u_sem:      mean={valid_u.mean():.4f}, std={valid_u.std():.4f}")
+            print(f"      u_sem_cond: mean={valid_u_cond.mean():.4f}, std={valid_u_cond.std():.4f}")
         else:
             print(f"    {group}: no valid samples (total={len(u_sems)})")
     
@@ -688,24 +702,57 @@ def run_evaluation_phase(config: ExperimentConfig,
     print("\n--- Enhanced Triad Split (artifactness-based) ---")
     enhanced_splitter = EnhancedTriadSplit(depiction_threshold=0.0)
     
-    # 모든 detection과 artifactness score를 합쳐서 enhanced split
+    # 모든 detection과 u_sem/u_sem_cond/s_art를 합침
     all_detections = []
     all_s_arts = []
     all_u_sems = []
+    all_u_sem_conds = []
     
     for group_name, detections in matched_data.items():
         if not isinstance(detections, list):
             continue
         s_arts = s_art_by_group.get(group_name, np.zeros(len(detections)))
         u_sems = u_sem_by_group.get(group_name, np.zeros(len(detections)))
+        u_sem_conds = u_sem_cond_by_group.get(group_name, np.zeros(len(detections)))
         
-        for det, s, u in zip(detections, s_arts, u_sems):
+        for det, s, u, uc in zip(detections, s_arts, u_sems, u_sem_conds):
             all_detections.append(det)
             all_s_arts.append(s)
             all_u_sems.append(u)
+            all_u_sem_conds.append(uc)
     
     enhanced_groups = enhanced_splitter.split_detections(all_detections, np.array(all_s_arts))
     enhanced_splitter.print_split_stats(enhanced_groups)
+    
+    # 3.5 Near-miss vs Hard-negative Split (핵심!)
+    print("\n--- Semantic FP Split (Near-miss vs Hard-negative) ---")
+    from .semantic_uncertainty import SemanticFPSplitter
+    
+    semantic_splitter = SemanticFPSplitter(
+        class_embeddings=u_sem_calculator.emb.base_embeddings,
+        class_names=class_names,
+        near_miss_threshold=0.5,   # cosine sim >= 0.5 → near-miss
+        hard_negative_threshold=0.2  # cosine sim <= 0.2 → hard-negative
+    )
+    
+    # Semantic_FP만 분리
+    semantic_fp_dets = matched_data.get("Semantic_FP", [])
+    semantic_fp_u_sems = u_sem_by_group.get("Semantic_FP", np.array([]))
+    semantic_fp_u_sem_conds = u_sem_cond_by_group.get("Semantic_FP", np.array([]))
+    
+    if len(semantic_fp_dets) > 0:
+        split_groups = semantic_splitter.split_semantic_fps(semantic_fp_dets, semantic_fp_u_sems)
+        semantic_splitter.print_split_stats(split_groups)
+        
+        # Top 혼동 클래스 쌍 출력
+        print("\n  Top confusion pairs:")
+        confusion_pairs = semantic_splitter.get_confusion_matrix_subset(semantic_fp_dets, top_k=10)
+        for pair in confusion_pairs[:5]:
+            print(f"    {pair['names'][0]} vs {pair['names'][1]}: "
+                  f"count={pair['count']}, sim={pair['similarity']:.3f}")
+    else:
+        split_groups = {}
+        print("  No Semantic_FP detections to split")
     
     # Enhanced groups에서 u_sem 재구성
     enhanced_u_sem = {}
@@ -722,15 +769,17 @@ def run_evaluation_phase(config: ExperimentConfig,
             enhanced_u_sem[group_name] = np.array(u_sems_for_group)
             enhanced_s_art[group_name] = np.array(s_arts_for_group)
     
-    # 3.6 H1 검증 (두 가지: 기존 Semantic_FP + 새로운 Depiction_FP)
+    # 3.6 H1 검증 (여러 버전)
     print("\n--- H1 Verification ---")
     evaluator = H1Evaluator()
     h1_result = None
+    h1_result_cond = None
+    h1_result_hard_neg = None
     h1_result_depiction = None
     
-    # A) 기존: TP vs Semantic_FP
+    # A) 기존: TP vs Semantic_FP (u_sem)
     if "TP" in matched_data and "Semantic_FP" in matched_data:
-        print("\n  [A] TP vs Semantic_FP (기존 정의):")
+        print("\n  [A] TP vs Semantic_FP (u_sem, 기존 정의):")
         conf_tp = np.array([d.confidence for d in matched_data["TP"]])
         conf_sem_fp = np.array([d.confidence for d in matched_data["Semantic_FP"]])
         
@@ -741,6 +790,39 @@ def run_evaluation_phase(config: ExperimentConfig,
             confidence_semantic_fp=conf_sem_fp,
         )
         print(format_h1_results(h1_result))
+    
+    # A-2) 조건부 u_sem: TP vs Semantic_FP (u_sem_cond)
+    if "TP" in matched_data and "Semantic_FP" in matched_data:
+        print("\n  [A-2] TP vs Semantic_FP (u_sem_cond, 조건부):")
+        h1_result_cond = evaluator.evaluate(
+            u_sem_tp=u_sem_cond_by_group.get("TP", np.array([])),
+            u_sem_semantic_fp=u_sem_cond_by_group.get("Semantic_FP", np.array([])),
+            confidence_tp=conf_tp,
+            confidence_semantic_fp=conf_sem_fp,
+        )
+        print(format_h1_results(h1_result_cond))
+    
+    # A-3) Hard-negative FP만: TP vs HardNegative_FP (핵심 가설 검증)
+    if len(split_groups.get("HardNegative_FP", [])) >= 10:
+        print("\n  [A-3] TP vs HardNegative_FP (진짜 semantic error):")
+        hard_neg_dets = [det for det, _ in split_groups["HardNegative_FP"]]
+        hard_neg_u_sems = np.array([u for _, u in split_groups["HardNegative_FP"]])
+        
+        # TP와 비교
+        tp_u = u_sem_by_group.get("TP", np.array([]))
+        
+        if len(tp_u) >= 10:
+            h1_result_hard_neg = evaluator.evaluate(
+                u_sem_tp=tp_u,
+                u_sem_semantic_fp=hard_neg_u_sems,
+                confidence_tp=conf_tp,
+                confidence_semantic_fp=np.array([d.confidence for d in hard_neg_dets]),
+            )
+            print(format_h1_results(h1_result_hard_neg))
+        else:
+            print("      TP 샘플 부족")
+    else:
+        print(f"\n  [A-3] HardNegative_FP 샘플 부족 ({len(split_groups.get('HardNegative_FP', []))}개)")
     
     # B) 새로운: TP vs Depiction_FP (H1 핵심 대상)
     if "TP" in enhanced_u_sem and "Depiction_FP" in enhanced_u_sem:

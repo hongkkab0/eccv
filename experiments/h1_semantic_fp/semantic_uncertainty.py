@@ -416,6 +416,97 @@ class SemanticUncertaintyCalculator:
         # ===== Step 5: JS divergence =====
         return js_divergence(posteriors)
     
+    def compute_u_sem_cond(self, region_feature: np.ndarray, cls_logits: np.ndarray = None) -> Tuple[float, int]:
+        """
+        조건부 u_sem 계산 (H1에 더 적합)
+        
+        핵심 아이디어:
+        - base predicted class = ĉ (top-1)
+        - 각 view에서 p_v(ĉ)를 측정
+        - u_sem_cond = 1 - mean(p_v(ĉ)) 또는 var(p_v(ĉ))
+        
+        의도:
+        - TP: base class가 맞으니 view에서도 그 class 지지 유지 → u_sem_cond 낮음
+        - FP: base class가 틀렸으니 view에서 지지 흔들림 → u_sem_cond 높음
+        
+        Returns:
+            (u_sem_cond, predicted_class_idx)
+        """
+        if region_feature is None or self.emb.base_embeddings is None:
+            return 0.0, -1
+        
+        # L2 normalize
+        region_norm = region_feature / (np.linalg.norm(region_feature) + 1e-8)
+        
+        # Base posterior & predicted class
+        if cls_logits is not None:
+            base_logits = cls_logits
+            raw_sim = np.dot(self.emb.base_embeddings, region_norm)
+            alpha = np.dot(raw_sim, base_logits) / (np.dot(raw_sim, raw_sim) + 1e-8)
+            alpha = max(alpha, 1.0)
+        else:
+            base_logits = np.dot(self.emb.base_embeddings, region_norm) / self.temperature
+            alpha = 1.0 / self.temperature
+        
+        base_posterior = softmax(base_logits)
+        pred_class = np.argmax(base_posterior)  # ĉ
+        
+        # 각 view에서 p_v(ĉ) 수집
+        p_pred_class = [base_posterior[pred_class]]  # base view
+        
+        for view_name in self.emb.view_names:
+            view_emb = self.emb.view_embeddings.get(view_name)
+            if view_emb is None:
+                continue
+            
+            raw_sim_view = np.dot(view_emb, region_norm)
+            logits_view = alpha * raw_sim_view
+            posterior_view = softmax(logits_view)
+            
+            p_pred_class.append(posterior_view[pred_class])
+        
+        p_pred_class = np.array(p_pred_class)
+        
+        # u_sem_cond = 1 - mean(p_v(ĉ))
+        # 높을수록 view 간 ĉ 지지가 약함 → FP 신호
+        u_sem_cond = 1.0 - np.mean(p_pred_class)
+        
+        return float(u_sem_cond), int(pred_class)
+    
+    def estimate_global_alpha(self, detections: List[Detection], n_samples: int = 1000) -> float:
+        """
+        다수 anchor에서 안정적인 global alpha 추정
+        
+        Returns:
+            median alpha (outlier에 robust)
+        """
+        alphas = []
+        
+        samples = detections[:n_samples] if len(detections) > n_samples else detections
+        
+        for det in samples:
+            if det.region_feature is None or det.cls_logits is None:
+                continue
+            
+            region_norm = det.region_feature / (np.linalg.norm(det.region_feature) + 1e-8)
+            raw_sim = np.dot(self.emb.base_embeddings, region_norm)
+            
+            alpha = np.dot(raw_sim, det.cls_logits) / (np.dot(raw_sim, raw_sim) + 1e-8)
+            if alpha > 0:
+                alphas.append(alpha)
+        
+        if not alphas:
+            return 100.0  # fallback
+        
+        median_alpha = np.median(alphas)
+        std_alpha = np.std(alphas)
+        
+        print(f"  Alpha estimation from {len(alphas)} samples:")
+        print(f"    Median: {median_alpha:.2f}, Std: {std_alpha:.2f}")
+        print(f"    Range: [{np.min(alphas):.2f}, {np.max(alphas):.2f}]")
+        
+        return float(median_alpha)
+    
     def compute_artifactness(self, region_feature: np.ndarray) -> float:
         """
         Artifactness score 계산
@@ -433,9 +524,9 @@ class SemanticUncertaintyCalculator:
         
         return float(np.max(dep_sims) - np.max(real_sims))
     
-    def compute_for_detection(self, detection: Detection) -> Tuple[float, float, Dict]:
+    def compute_for_detection(self, detection: Detection) -> Tuple[float, float, float, Dict]:
         """
-        단일 detection의 u_sem, s_art 계산
+        단일 detection의 u_sem, u_sem_cond, s_art 계산
         
         우선순위:
         1. region_feature + cls_logits: 캘리브레이션된 u_sem (best)
@@ -444,7 +535,7 @@ class SemanticUncertaintyCalculator:
         4. 둘 다 없으면: drop
         
         Returns:
-            (u_sem, s_art, debug_info)
+            (u_sem, u_sem_cond, s_art, debug_info)
         """
         debug_info = {"status": "ok", "source": "none"}
         
@@ -453,37 +544,43 @@ class SemanticUncertaintyCalculator:
             feat = detection.region_feature
             logits = detection.cls_logits
             u_sem = self.compute_u_sem(feat, logits)
+            u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, logits)
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature+cls_logits"
-            return u_sem, s_art, debug_info
+            debug_info["pred_class"] = pred_cls
+            return u_sem, u_sem_cond, s_art, debug_info
         
         # 2. region_feature만 (cls_logits 없음)
         if detection.region_feature is not None:
             feat = detection.region_feature
             u_sem = self.compute_u_sem(feat, None)
+            u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, None)
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature"
-            return u_sem, s_art, debug_info
+            debug_info["pred_class"] = pred_cls
+            return u_sem, u_sem_cond, s_art, debug_info
         
         # 3. cls_logits만 있으면 (fused 모델)
         if detection.cls_logits is not None:
             u_sem = self.compute_u_sem_from_logits(detection.cls_logits)
+            u_sem_cond = u_sem  # fallback: 같은 값 사용
             s_art = 0.0  # fused 모델에서는 artifactness 계산 불가
             debug_info["source"] = "cls_logits"
-            return u_sem, s_art, debug_info
+            return u_sem, u_sem_cond, s_art, debug_info
         
         # 4. 둘 다 없으면 drop
-        return 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
+        return 0.0, 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
     
     def compute_for_detections(self, detections: List[Detection], 
-                               verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, Dict]:
+                               verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
         """
-        여러 detection의 u_sem, s_art 일괄 계산
+        여러 detection의 u_sem, u_sem_cond, s_art 일괄 계산
         
         Returns:
-            (u_sem_array, s_art_array, drop_stats)
+            (u_sem_array, u_sem_cond_array, s_art_array, drop_stats)
         """
         u_sems = []
+        u_sem_conds = []
         s_arts = []
         
         drop_stats = {
@@ -498,8 +595,9 @@ class SemanticUncertaintyCalculator:
             if verbose and (i + 1) % 100 == 0:
                 print(f"    Processing {i+1}/{len(detections)}...")
             
-            u_sem, s_art, info = self.compute_for_detection(det)
+            u_sem, u_sem_cond, s_art, info = self.compute_for_detection(det)
             u_sems.append(u_sem)
+            u_sem_conds.append(u_sem_cond)
             s_arts.append(s_art)
             
             if info["status"] == "ok":
@@ -518,7 +616,7 @@ class SemanticUncertaintyCalculator:
             print(f"      from_cls_logits: {drop_stats['from_cls_logits']}")
             print(f"      dropped: {drop_stats['dropped']}")
         
-        return np.array(u_sems), np.array(s_arts), drop_stats
+        return np.array(u_sems), np.array(u_sem_conds), np.array(s_arts), drop_stats
     
     def sanity_check(self, detection: Detection):
         """
