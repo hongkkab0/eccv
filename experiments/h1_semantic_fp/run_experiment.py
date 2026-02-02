@@ -68,7 +68,7 @@ def parse_args():
                         help="Batch size for inference")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory")
-    parser.add_argument("--conf-threshold", type=float, default=0.001,
+    parser.add_argument("--conf-threshold", type=float, default=0.5,
                         help="Confidence threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.5,
                         help="IoU threshold for TP")
@@ -471,7 +471,8 @@ def run_detection_phase(config: ExperimentConfig,
     
     # Feature extractor hooks 제거
     feature_extractor.remove_hooks()
-    print(f"  Extracted YOLOE visual features for {sum(1 for d in logger.detections if d.region_feature is not None)} detections")
+    feat_count = sum(1 for d in logger.detections if d.region_feature is not None)
+    print(f"  Saved {feat_count} visual features (for cv4 attribute score calculation in Phase 3)")
     
     return logger
 

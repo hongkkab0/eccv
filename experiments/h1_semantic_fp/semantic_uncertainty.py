@@ -359,8 +359,8 @@ class SemanticUncertaintyCalculator:
         # {class_idx: [K, embed_dim]}
         self.class_view_embeddings = {}
         for class_idx in class_names.keys():
-            if class_idx in attribute_cache.cache:
-                views = attribute_cache.cache[class_idx]
+            if class_idx in attribute_cache.class_views:
+                views = attribute_cache.class_views[class_idx]
                 # [K, embed_dim]
                 emb = np.stack([views.view_embeddings[k] for k in range(len(views.view_embeddings))])
                 self.class_view_embeddings[class_idx] = torch.from_numpy(emb).float().to(device)
