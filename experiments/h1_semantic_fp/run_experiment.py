@@ -497,16 +497,12 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (YOLOE attribute inference)
-    print("\n--- Semantic Uncertainty Calculation (YOLOE attribute inference) ---")
+    # 3.3 u_sem 계산 (CLIP 기반)
+    print("\n--- Semantic Uncertainty Calculation (CLIP scorer) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
-        attribute_cache=attribute_cache,
         class_names=class_names,
-        model=model,  # attribute inference용
-        top_m=config.top_m_classes,
         device=config.device,
     )
-    print(f"  Will run YOLOE inference with attribute embeddings for each detection")
     
     # YOLOE feature로 u_sem 계산
     u_sem_by_group = {}
@@ -526,11 +522,9 @@ def run_evaluation_phase(config: ExperimentConfig,
             summary = {k: _fmt(v) for k, v in stats.items()}
             print(f"    {group}: {summary}")
     
-    # 3.4 Artifactness Score (Track B)
-    print("\n--- Artifactness Score Calculation ---")
-    # MobileCLIP 사용 (캐시 있으면 캐시 사용)
+    # 3.4 Artifactness Score (Track B) - CLIP 기반
+    print("\n--- Artifactness Score Calculation (CLIP) ---")
     art_scorer = ArtifactnessScorer(
-        text_model_name=config.text_model,
         device=config.device,
         method="margin",
     )

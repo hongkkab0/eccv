@@ -63,71 +63,63 @@ class ArtifactnessPrompts:
 
 class ArtifactnessScorer:
     """
-    Artifactness score 계산기
+    Artifactness score 계산기 (CLIP 기반)
     
-    Track B: Visual Primitives
-    - s_art = max_j <f, T(q_j)> (depiction 최대 유사도)
-    - 또는 margin: s_art = <f, T(real)> - max_j <f, T(depiction)>
+    CLIP으로 bbox crop embedding과 depiction/real prompt의 similarity 비교
+    - s_art = max_j <f, T(depiction_j)> - mean(<f, T(real)>)
+    
+    SemanticUncertaintyCalculator와 같은 CLIP 모델 사용
     """
     
     def __init__(self,
-                 text_model_name: str = "mobileclip:blt",
                  device: str = "cuda",
-                 method: str = "margin",
-                 cache_path: str = "tools/mobileclip_blt/artifactness_embeddings.pt"):
+                 method: str = "margin"):
         """
         Args:
-            text_model_name: 텍스트 모델 이름
             device: 디바이스
-            cache_path: 미리 생성된 임베딩 캐시 경로
             method: "max" 또는 "margin"
         """
-        self.text_model_name = text_model_name
         self.device = device
         self.method = method
-        self.cache_path = cache_path
         
         self.prompts = ArtifactnessPrompts()
+        
+        # CLIP 모델 로드
+        self.clip_model = None
+        self.clip_preprocess = None
         
         # 임베딩 캐시
         self.depiction_embeddings: Optional[np.ndarray] = None
         self.real_embeddings: Optional[np.ndarray] = None
         
-        self._initialize_embeddings()
+        self._initialize_clip()
     
-    def _initialize_embeddings(self):
-        """프롬프트 임베딩 초기화 (캐시 우선)"""
-        from pathlib import Path
-        cache_file = Path(self.cache_path)
-        
-        if cache_file.exists():
-            print(f"  Loading cached artifactness embeddings from {self.cache_path}...")
-            cached_emb = torch.load(cache_file, map_location=self.device)
+    def _initialize_clip(self):
+        """CLIP 모델 및 임베딩 초기화"""
+        try:
+            import clip
+            self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.device)
+            self.clip_model.eval()
+            print(f"  Loaded CLIP ViT-B/32 for artifactness scoring")
             
-            # 캐시에서 임베딩 추출
-            dep_list = [cached_emb[text] for text in self.prompts.depiction_prompts if text in cached_emb]
-            real_list = [cached_emb[text] for text in self.prompts.real_prompts if text in cached_emb]
-            
-            if len(dep_list) > 0:
-                self.depiction_embeddings = torch.stack(dep_list).cpu().numpy()
-            if len(real_list) > 0:
-                self.real_embeddings = torch.stack(real_list).cpu().numpy()
-            print(f"  Loaded {len(dep_list)} depiction + {len(real_list)} real embeddings")
-        else:
-            print(f"  Cache not found at {self.cache_path}, loading text model...")
-            from ultralytics.nn.text_model import build_text_model
-            
-            text_model = build_text_model(self.text_model_name, device=self.device)
-            text_model.eval()
-            
+            # Text embeddings 생성
             with torch.no_grad():
                 # Depiction 임베딩
-                dep_tokens = text_model.tokenize(self.prompts.depiction_prompts)
-                self.depiction_embeddings = text_model.encode_text(dep_tokens).cpu().numpy()
+                dep_tokens = clip.tokenize(self.prompts.depiction_prompts).to(self.device)
+                dep_feats = self.clip_model.encode_text(dep_tokens)
+                dep_feats = dep_feats / dep_feats.norm(dim=-1, keepdim=True)
+                self.depiction_embeddings = dep_feats.cpu().numpy()
                 
                 # Real 임베딩
-                real_tokens = text_model.tokenize(self.prompts.real_prompts)
-                self.real_embeddings = text_model.encode_text(real_tokens).cpu().numpy()
+                real_tokens = clip.tokenize(self.prompts.real_prompts).to(self.device)
+                real_feats = self.clip_model.encode_text(real_tokens)
+                real_feats = real_feats / real_feats.norm(dim=-1, keepdim=True)
+                self.real_embeddings = real_feats.cpu().numpy()
+            
+            print(f"  Built {len(self.prompts.depiction_prompts)} depiction + {len(self.prompts.real_prompts)} real embeddings")
+            
+        except ImportError:
+            print("  WARNING: clip not installed")
     
     def compute_score(self, region_feature: np.ndarray) -> float:
         """
@@ -186,17 +178,61 @@ class ArtifactnessScorer:
             "margin": float(np.max(dep_sims) - np.max(real_sims)),
         }
     
-    def compute_for_detection(self, detection: Detection) -> float:
-        """Detection의 artifactness score 계산"""
-        if detection.region_feature is None:
+    def compute_for_detection(self, detection: Detection, image_emb: np.ndarray = None) -> float:
+        """
+        Detection의 artifactness score 계산
+        
+        Args:
+            detection: Detection 객체
+            image_emb: 미리 계산된 CLIP image embedding (없으면 직접 계산)
+        """
+        # image_emb가 제공되면 사용
+        if image_emb is not None:
+            return self.compute_score(image_emb)
+        
+        # 없으면 직접 CLIP encoding
+        if detection.image_path is None or self.clip_model is None:
             return 0.0
-        return self.compute_score(detection.region_feature)
+        
+        try:
+            from PIL import Image
+            img = Image.open(detection.image_path).convert('RGB')
+            
+            # Crop
+            x1, y1, x2, y2 = map(int, detection.bbox)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img.width, x2), min(img.height, y2)
+            
+            if x2 <= x1 or y2 <= y1:
+                return 0.0
+            
+            crop = img.crop((x1, y1, x2, y2))
+            
+            # CLIP encoding
+            with torch.no_grad():
+                crop_tensor = self.clip_preprocess(crop).unsqueeze(0).to(self.device)
+                features = self.clip_model.encode_image(crop_tensor)
+                features = features / features.norm(dim=-1, keepdim=True)
+                image_emb = features.cpu().numpy().squeeze()
+            
+            return self.compute_score(image_emb)
+            
+        except Exception as e:
+            return 0.0
     
-    def compute_for_detections(self, detections: List[Detection]) -> np.ndarray:
-        """여러 detection의 artifactness score 일괄 계산"""
+    def compute_for_detections(self, detections: List[Detection], 
+                                image_embs: List[np.ndarray] = None) -> np.ndarray:
+        """
+        여러 detection의 artifactness score 일괄 계산
+        
+        Args:
+            detections: Detection 리스트
+            image_embs: 미리 계산된 CLIP image embeddings (없으면 직접 계산)
+        """
         scores = []
-        for det in detections:
-            scores.append(self.compute_for_detection(det))
+        for i, det in enumerate(detections):
+            emb = image_embs[i] if image_embs is not None else None
+            scores.append(self.compute_for_detection(det, emb))
         return np.array(scores)
     
     def compute_for_triad_split(self,
