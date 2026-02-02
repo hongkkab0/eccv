@@ -473,6 +473,72 @@ class SemanticUncertaintyCalculator:
         
         return float(u_sem_cond), int(pred_class)
     
+    def compute_u_gt(self, region_feature: np.ndarray, gt_class: int, 
+                     cls_logits: np.ndarray = None) -> float:
+        """
+        GT class 조건부 불확실성 (H1 핵심 지표)
+        
+        u_gt = 1 - mean_v p_v(y_gt)
+        
+        의도:
+        - TP: GT class에 대한 view 지지 유지 → u_gt 낮음
+        - FP: GT class에 대한 view 지지 약함 → u_gt 높음
+        
+        Args:
+            region_feature: [512] anchor feature
+            gt_class: GT class index
+            cls_logits: [nc] pre-sigmoid logits (optional)
+        
+        Returns:
+            u_gt 값
+        """
+        if region_feature is None or self.emb.base_embeddings is None:
+            return 0.0
+        
+        if gt_class < 0 or gt_class >= len(self.emb.base_embeddings):
+            return 0.0
+        
+        # L2 normalize
+        region_norm = region_feature / (np.linalg.norm(region_feature) + 1e-8)
+        
+        # Alpha 계산
+        if cls_logits is not None:
+            raw_sim = np.dot(self.emb.base_embeddings, region_norm)
+            alpha = np.dot(raw_sim, cls_logits) / (np.dot(raw_sim, raw_sim) + 1e-8)
+            alpha = max(alpha, 1.0)
+        else:
+            alpha = 1.0 / self.temperature
+        
+        # 각 view에서 p_v(gt_class) 수집
+        p_gt_class = []
+        
+        # base view
+        if cls_logits is not None:
+            base_posterior = softmax(cls_logits)
+        else:
+            base_logits = np.dot(self.emb.base_embeddings, region_norm) / self.temperature
+            base_posterior = softmax(base_logits)
+        p_gt_class.append(base_posterior[gt_class])
+        
+        # attribute views
+        for view_name in self.emb.view_names:
+            view_emb = self.emb.view_embeddings.get(view_name)
+            if view_emb is None:
+                continue
+            
+            raw_sim_view = np.dot(view_emb, region_norm)
+            logits_view = alpha * raw_sim_view
+            posterior_view = softmax(logits_view)
+            
+            p_gt_class.append(posterior_view[gt_class])
+        
+        p_gt_class = np.array(p_gt_class)
+        
+        # u_gt = 1 - mean(p_v(gt_class))
+        u_gt = 1.0 - np.mean(p_gt_class)
+        
+        return float(u_gt)
+    
     def estimate_global_alpha(self, detections: List[Detection], n_samples: int = 1000) -> float:
         """
         다수 anchor에서 안정적인 global alpha 추정
@@ -524,9 +590,9 @@ class SemanticUncertaintyCalculator:
         
         return float(np.max(dep_sims) - np.max(real_sims))
     
-    def compute_for_detection(self, detection: Detection) -> Tuple[float, float, float, Dict]:
+    def compute_for_detection(self, detection: Detection) -> Tuple[float, float, float, float, Dict]:
         """
-        단일 detection의 u_sem, u_sem_cond, s_art 계산
+        단일 detection의 u_sem, u_sem_cond, u_gt, s_art 계산
         
         우선순위:
         1. region_feature + cls_logits: 캘리브레이션된 u_sem (best)
@@ -535,9 +601,18 @@ class SemanticUncertaintyCalculator:
         4. 둘 다 없으면: drop
         
         Returns:
-            (u_sem, u_sem_cond, s_art, debug_info)
+            (u_sem, u_sem_cond, u_gt, s_art, debug_info)
         """
         debug_info = {"status": "ok", "source": "none"}
+        
+        # GT class 결정 (Semantic FP의 경우 overlapping GT)
+        gt_class = -1
+        if detection.is_tp and detection.matched_gt_class is not None:
+            gt_class = detection.matched_gt_class
+        elif detection.overlapping_gt_class is not None:
+            gt_class = detection.overlapping_gt_class
+        elif detection.matched_gt_class is not None:
+            gt_class = detection.matched_gt_class
         
         # 1. region_feature + cls_logits (best: 캘리브레이션된 스케일)
         if detection.region_feature is not None and detection.cls_logits is not None:
@@ -545,42 +620,48 @@ class SemanticUncertaintyCalculator:
             logits = detection.cls_logits
             u_sem = self.compute_u_sem(feat, logits)
             u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, logits)
+            u_gt = self.compute_u_gt(feat, gt_class, logits) if gt_class >= 0 else 0.0
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature+cls_logits"
             debug_info["pred_class"] = pred_cls
-            return u_sem, u_sem_cond, s_art, debug_info
+            debug_info["gt_class"] = gt_class
+            return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 2. region_feature만 (cls_logits 없음)
         if detection.region_feature is not None:
             feat = detection.region_feature
             u_sem = self.compute_u_sem(feat, None)
             u_sem_cond, pred_cls = self.compute_u_sem_cond(feat, None)
+            u_gt = self.compute_u_gt(feat, gt_class, None) if gt_class >= 0 else 0.0
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature"
             debug_info["pred_class"] = pred_cls
-            return u_sem, u_sem_cond, s_art, debug_info
+            debug_info["gt_class"] = gt_class
+            return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 3. cls_logits만 있으면 (fused 모델)
         if detection.cls_logits is not None:
             u_sem = self.compute_u_sem_from_logits(detection.cls_logits)
             u_sem_cond = u_sem  # fallback: 같은 값 사용
+            u_gt = 0.0  # fused 모델에서는 u_gt 계산 불가
             s_art = 0.0  # fused 모델에서는 artifactness 계산 불가
             debug_info["source"] = "cls_logits"
-            return u_sem, u_sem_cond, s_art, debug_info
+            return u_sem, u_sem_cond, u_gt, s_art, debug_info
         
         # 4. 둘 다 없으면 drop
-        return 0.0, 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
+        return 0.0, 0.0, 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
     
     def compute_for_detections(self, detections: List[Detection], 
-                               verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+                               verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
         """
-        여러 detection의 u_sem, u_sem_cond, s_art 일괄 계산
+        여러 detection의 u_sem, u_sem_cond, u_gt, s_art 일괄 계산
         
         Returns:
-            (u_sem_array, u_sem_cond_array, s_art_array, drop_stats)
+            (u_sem_array, u_sem_cond_array, u_gt_array, s_art_array, drop_stats)
         """
         u_sems = []
         u_sem_conds = []
+        u_gts = []
         s_arts = []
         
         drop_stats = {
@@ -595,9 +676,10 @@ class SemanticUncertaintyCalculator:
             if verbose and (i + 1) % 100 == 0:
                 print(f"    Processing {i+1}/{len(detections)}...")
             
-            u_sem, u_sem_cond, s_art, info = self.compute_for_detection(det)
+            u_sem, u_sem_cond, u_gt, s_art, info = self.compute_for_detection(det)
             u_sems.append(u_sem)
             u_sem_conds.append(u_sem_cond)
+            u_gts.append(u_gt)
             s_arts.append(s_art)
             
             if info["status"] == "ok":
@@ -616,7 +698,7 @@ class SemanticUncertaintyCalculator:
             print(f"      from_cls_logits: {drop_stats['from_cls_logits']}")
             print(f"      dropped: {drop_stats['dropped']}")
         
-        return np.array(u_sems), np.array(u_sem_conds), np.array(s_arts), drop_stats
+        return np.array(u_sems), np.array(u_sem_conds), np.array(u_gts), np.array(s_arts), drop_stats
     
     def sanity_check(self, detection: Detection):
         """
@@ -754,55 +836,145 @@ class EnhancedTriadSplit:
 
 
 # =============================================================================
-# Semantic FP 재분해: Near-miss vs Hard-negative
+# Semantic FP 재분해: Taxonomy 기반 (Near-miss vs Hard-negative)
 # =============================================================================
+
+# LVIS 상위 카테고리 매핑 (간략화된 버전)
+LVIS_SUPERCATEGORIES = {
+    # 사람/신체
+    "person": "person", "man": "person", "woman": "person", "child": "person",
+    "boy": "person", "girl": "person", "baby": "person", "face": "person",
+    "hand": "person", "arm": "person", "leg": "person", "foot": "person",
+    "head": "person", "hair": "person", "eye": "person", "nose": "person",
+    
+    # 의류
+    "shirt": "clothing", "pants": "clothing", "trousers": "clothing", "dress": "clothing",
+    "coat": "clothing", "jacket": "clothing", "shoe": "clothing", "boot": "clothing",
+    "hat": "clothing", "cap": "clothing", "sock": "clothing", "glove": "clothing",
+    "scarf": "clothing", "tie": "clothing", "belt": "clothing", "skirt": "clothing",
+    
+    # 가구
+    "chair": "furniture", "table": "furniture", "desk": "furniture", "bed": "furniture",
+    "sofa": "furniture", "couch": "furniture", "bench": "furniture", "stool": "furniture",
+    "cabinet": "furniture", "shelf": "furniture", "drawer": "furniture", "armchair": "furniture",
+    "recliner": "furniture", "ottoman": "furniture", "bookcase": "furniture",
+    
+    # 음식
+    "food": "food", "fruit": "food", "vegetable": "food", "bread": "food",
+    "meat": "food", "cake": "food", "pizza": "food", "sandwich": "food",
+    "hamburger": "food", "hotdog": "food", "apple": "food", "banana": "food",
+    "orange": "food", "salad": "food", "soup": "food", "rice": "food",
+    
+    # 동물
+    "dog": "animal", "cat": "animal", "bird": "animal", "horse": "animal",
+    "cow": "animal", "sheep": "animal", "elephant": "animal", "bear": "animal",
+    "zebra": "animal", "giraffe": "animal", "fish": "animal", "chicken": "animal",
+    
+    # 차량
+    "car": "vehicle", "truck": "vehicle", "bus": "vehicle", "motorcycle": "vehicle",
+    "bicycle": "vehicle", "train": "vehicle", "airplane": "vehicle", "boat": "vehicle",
+    "ship": "vehicle", "van": "vehicle", "taxi": "vehicle",
+    
+    # 전자기기
+    "computer": "electronic", "laptop": "electronic", "phone": "electronic", "television": "electronic",
+    "tv": "electronic", "monitor": "electronic", "keyboard": "electronic", "mouse": "electronic",
+    "camera": "electronic", "clock": "electronic", "watch": "electronic", "lamp": "electronic",
+    
+    # 용기/그릇
+    "bottle": "container", "cup": "container", "bowl": "container", "plate": "container",
+    "glass": "container", "mug": "container", "jar": "container", "pot": "container",
+    "pan": "container", "vase": "container", "basket": "container", "box": "container",
+    
+    # 도구
+    "knife": "tool", "fork": "tool", "spoon": "tool", "scissors": "tool",
+    "hammer": "tool", "screwdriver": "tool", "wrench": "tool", "brush": "tool",
+    
+    # 스포츠
+    "ball": "sports", "bat": "sports", "racket": "sports", "skateboard": "sports",
+    "surfboard": "sports", "skis": "sports", "tennis": "sports", "baseball": "sports",
+}
+
+def get_supercategory(class_name: str) -> str:
+    """클래스 이름에서 상위 카테고리 추출"""
+    # 클래스 이름 정리
+    name_clean = class_name.lower().split("/")[0].replace("_", " ").strip()
+    
+    # 직접 매칭
+    if name_clean in LVIS_SUPERCATEGORIES:
+        return LVIS_SUPERCATEGORIES[name_clean]
+    
+    # 부분 매칭 (클래스 이름에 키워드가 포함된 경우)
+    for keyword, supercat in LVIS_SUPERCATEGORIES.items():
+        if keyword in name_clean or name_clean in keyword:
+            return supercat
+    
+    return "other"
+
 
 class SemanticFPSplitter:
     """
-    Semantic FP를 pred/gt 텍스트 유사도 기준으로 분해
+    Semantic FP를 Taxonomy 기반으로 분해 (임베딩 sim은 보조)
     
-    Near-miss FP: pred와 gt가 의미적으로 유사 (chair vs armchair)
-    Hard-negative FP: pred와 gt가 의미적으로 다름 (chair vs table)
+    Near-miss FP: 같은 상위 카테고리 (chair vs armchair)
+    Hard-negative FP: 다른 상위 카테고리 (chair vs dog)
     """
     
     def __init__(self, 
                  class_embeddings: np.ndarray,  # [nc, 512]
                  class_names: Dict[int, str],
-                 near_miss_threshold: float = 0.7,  # cosine similarity
-                 hard_negative_threshold: float = 0.3):
+                 use_taxonomy: bool = True):  # 기본값: taxonomy 사용
         """
         Args:
-            class_embeddings: 클래스별 텍스트 임베딩
+            class_embeddings: 클래스별 텍스트 임베딩 (보조용)
             class_names: {idx: name}
-            near_miss_threshold: 이 이상이면 near-miss
-            hard_negative_threshold: 이 이하면 hard-negative
+            use_taxonomy: True면 taxonomy 기반, False면 임베딩 sim 기반
         """
         self.class_emb = class_embeddings
         self.class_names = class_names
-        self.near_miss_threshold = near_miss_threshold
-        self.hard_negative_threshold = hard_negative_threshold
+        self.use_taxonomy = use_taxonomy
         
-        # L2 normalize embeddings
-        norms = np.linalg.norm(self.class_emb, axis=1, keepdims=True)
-        self.class_emb_norm = self.class_emb / (norms + 1e-8)
+        # L2 normalize embeddings (보조용)
+        if class_embeddings is not None:
+            norms = np.linalg.norm(self.class_emb, axis=1, keepdims=True)
+            self.class_emb_norm = self.class_emb / (norms + 1e-8)
+        else:
+            self.class_emb_norm = None
+        
+        # 클래스별 상위 카테고리 캐시
+        self.class_supercats = {}
+        for idx, name in class_names.items():
+            self.class_supercats[idx] = get_supercategory(name)
     
     def get_class_similarity(self, class_a: int, class_b: int) -> float:
-        """두 클래스 간 코사인 유사도"""
+        """두 클래스 간 코사인 유사도 (보조용)"""
+        if self.class_emb_norm is None:
+            return 0.0
         if class_a >= len(self.class_emb_norm) or class_b >= len(self.class_emb_norm):
             return 0.0
         return float(np.dot(self.class_emb_norm[class_a], self.class_emb_norm[class_b]))
+    
+    def is_same_supercategory(self, class_a: int, class_b: int) -> bool:
+        """두 클래스가 같은 상위 카테고리인지"""
+        supercat_a = self.class_supercats.get(class_a, "other")
+        supercat_b = self.class_supercats.get(class_b, "other")
+        
+        # "other"끼리는 같은 카테고리로 취급하지 않음
+        if supercat_a == "other" or supercat_b == "other":
+            return False
+        
+        return supercat_a == supercat_b
     
     def split_semantic_fps(self, 
                            detections: List[Detection],
                            u_sems: np.ndarray) -> Dict[str, List[Tuple[Detection, float]]]:
         """
-        Semantic FP를 3가지로 분해
+        Semantic FP를 Taxonomy 기반으로 분해
         
         Returns:
             {
-                "NearMiss_FP": [(det, u_sem), ...],  # pred/gt 유사 (동의어/계층 충돌)
-                "HardNegative_FP": [(det, u_sem), ...],  # pred/gt 다름 (진짜 오류)
-                "Ambiguous_FP": [(det, u_sem), ...],  # 중간
+                "NearMiss_FP": [(det, u_sem), ...],  # 같은 상위 카테고리 (chair vs armchair)
+                "HardNegative_FP": [(det, u_sem), ...],  # 다른 상위 카테고리 (chair vs dog)
+                "Ambiguous_FP": [(det, u_sem), ...],  # 분류 불가
             }
         """
         groups = {
@@ -816,7 +988,6 @@ class SemanticFPSplitter:
             if det.triad_label != "Semantic_FP":
                 continue
             
-            # pred/gt 클래스 유사도 계산
             pred_cls = det.pred_class
             gt_cls = det.overlapping_gt_class if det.overlapping_gt_class is not None else det.matched_gt_class
             
@@ -824,34 +995,47 @@ class SemanticFPSplitter:
                 groups["Ambiguous_FP"].append((det, u_sem))
                 continue
             
-            sim = self.get_class_similarity(pred_cls, gt_cls)
-            
-            if sim >= self.near_miss_threshold:
-                groups["NearMiss_FP"].append((det, u_sem))
-            elif sim <= self.hard_negative_threshold:
-                groups["HardNegative_FP"].append((det, u_sem))
+            # Taxonomy 기반 분류
+            if self.use_taxonomy:
+                same_supercat = self.is_same_supercategory(pred_cls, gt_cls)
+                
+                if same_supercat:
+                    groups["NearMiss_FP"].append((det, u_sem))
+                else:
+                    # 다른 상위 카테고리 = Hard-negative
+                    groups["HardNegative_FP"].append((det, u_sem))
             else:
-                groups["Ambiguous_FP"].append((det, u_sem))
+                # 임베딩 sim 기반 (fallback)
+                sim = self.get_class_similarity(pred_cls, gt_cls)
+                if sim >= 0.5:
+                    groups["NearMiss_FP"].append((det, u_sem))
+                elif sim <= 0.2:
+                    groups["HardNegative_FP"].append((det, u_sem))
+                else:
+                    groups["Ambiguous_FP"].append((det, u_sem))
         
         return groups
     
     def print_split_stats(self, groups: Dict, u_sems: np.ndarray = None):
         """Split 통계 출력"""
-        print("\n  Semantic FP Split (by pred/gt similarity):")
+        method = "taxonomy" if self.use_taxonomy else "embedding_sim"
+        print(f"\n  Semantic FP Split (method={method}):")
+        
         for name, items in groups.items():
             if items:
                 u_vals = [u for _, u in items]
                 print(f"    {name}: {len(items)} detections")
                 print(f"      u_sem: mean={np.mean(u_vals):.4f}, std={np.std(u_vals):.4f}")
                 
-                # 예시 출력
-                if len(items) > 0:
-                    det, u = items[0]
+                # 예시 출력 (최대 3개)
+                for i, (det, u) in enumerate(items[:3]):
                     gt_cls = det.overlapping_gt_class if det.overlapping_gt_class is not None else det.matched_gt_class
                     pred_name = self.class_names.get(det.pred_class, "?")
                     gt_name = self.class_names.get(gt_cls, "?") if gt_cls is not None else "?"
-                    sim = self.get_class_similarity(det.pred_class, gt_cls) if gt_cls else 0
-                    print(f"      Example: {pred_name} vs {gt_name} (sim={sim:.2f})")
+                    pred_supercat = self.class_supercats.get(det.pred_class, "other")
+                    gt_supercat = self.class_supercats.get(gt_cls, "other") if gt_cls else "other"
+                    
+                    print(f"      Ex{i+1}: {pred_name}({pred_supercat}) vs {gt_name}({gt_supercat})")
             else:
                 print(f"    {name}: 0 detections")
     
