@@ -114,6 +114,29 @@ def run_detection_phase(config: ExperimentConfig,
     print("Phase 1: Detection and Triad Split")
     print("="*60)
     
+    # CRITICAL: fuse 상태 확인 (detection phase 시작 전)
+    head = model.model.model[-1]
+    cv3_out_dim = head.cv3[0][-1].weight.shape[0] if hasattr(head, 'cv3') else -1
+    embed_dim = head.embed if hasattr(head, 'embed') else 512
+    
+    print(f"  Checking model fuse status...")
+    print(f"    cv3 output dim: {cv3_out_dim}")
+    print(f"    embed_dim: {embed_dim}")
+    print(f"    is_fused flag: {head.is_fused if hasattr(head, 'is_fused') else 'N/A'}")
+    
+    if cv3_out_dim != embed_dim:
+        raise RuntimeError(
+            f"\n\nFATAL: Model is FUSED - cannot capture 512-dim region features!\n"
+            f"  cv3 outputs {cv3_out_dim} dims instead of {embed_dim}\n\n"
+            f"SOLUTION:\n"
+            f"  1. Use unfused checkpoint (download original YOLOE weights)\n"
+            f"  2. Or check if checkpoint was saved after fuse() call\n\n"
+            f"Current checkpoint may have been created with:\n"
+            f"  model.fuse() or get_vocab() which calls fuse() internally"
+        )
+    else:
+        print(f"    OK: Model is NOT fused - 512-dim features will be captured")
+    
     # 데이터 로더 준비
     data = check_det_dataset(config.data_yaml)
     
