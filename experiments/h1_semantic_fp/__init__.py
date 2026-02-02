@@ -68,8 +68,6 @@ from .semantic_uncertainty import (
     SemanticUncertaintyCalculator,
     EnhancedTriadSplit,
     MobileCLIPScorer,
-    DEPICTION_REPLICA_CLASSES,
-    is_depiction_replica_class,
 )
 
 from .artifactness_score import (
