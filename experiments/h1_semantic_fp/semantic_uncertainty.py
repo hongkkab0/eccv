@@ -1,16 +1,16 @@
 """
 Semantic Uncertainty (u_sem) Calculation
 =========================================
-YOLOE region feature + MobileCLIP attribute embeddings → JS divergence
+YOLOE region feature + 캐시된 MobileCLIP embeddings → JS divergence
 
 핵심:
-1. YOLOE head에서 cv3 출력 (512-dim region feature) 캡처
-2. detection bbox 중심에 해당하는 anchor 위치의 feature 추출
-3. MobileCLIP attribute embedding table과 matmul → view별 posterior → JS
+1. YOLOE head에서 cv3 출력 (512-dim anchor feature) 캡처 (fuse 전!)
+2. 캐시된 MobileCLIP text embeddings 사용 (모델 로드 X)
+3. anchor feature · text_emb → view별 posterior → JS
 
 장점:
+- MobileCLIP 모델 로드 불필요 (캐시만 사용)
 - YOLOE 파이프라인 유지
-- MobileCLIP 임베딩 공간 일관성
 - CLIP fallback 없음
 """
 
@@ -57,73 +57,17 @@ def js_divergence(distributions: np.ndarray, weights: Optional[np.ndarray] = Non
 
 
 # =============================================================================
-# YOLOE Region Feature Extractor
+# 캐시된 MobileCLIP Embeddings 로더
 # =============================================================================
 
-class YOLOERegionFeatureExtractor:
+class CachedEmbeddings:
     """
-    YOLOE에서 region feature 추출
+    캐시된 MobileCLIP text embeddings 로더
     
-    head._region_features: [B, embed, num_anchors]
-    anchors, strides로 bbox 중심에 가장 가까운 anchor 찾아서 feature 추출
-    """
-    
-    def __init__(self, model, device: str = "cuda"):
-        self.model = model
-        self.device = device
-        self.head = model.model.model[-1]  # YOLOEDetect
-        
-    def get_feature_for_bbox(self, bbox: np.ndarray, img_shape: Tuple[int, int]) -> Optional[np.ndarray]:
-        """
-        bbox 중심에 해당하는 anchor 위치의 region feature 추출
-        
-        Args:
-            bbox: [x1, y1, x2, y2] xyxy 좌표
-            img_shape: (H, W) 이미지 크기
-            
-        Returns:
-            [embed] feature vector 또는 None
-        """
-        if not hasattr(self.head, '_region_features') or self.head._region_features is None:
-            return None
-        
-        region_features = self.head._region_features[0]  # [embed, num_anchors]
-        
-        if not hasattr(self.head, 'anchors') or self.head.anchors is None:
-            return None
-        
-        anchors = self.head.anchors  # [2, num_anchors]
-        strides = self.head.strides  # [num_anchors]
-        
-        # bbox 중심점
-        cx = (bbox[0] + bbox[2]) / 2
-        cy = (bbox[1] + bbox[3]) / 2
-        
-        # anchor 좌표를 pixel 좌표로 변환
-        anchor_px = anchors.T * strides.unsqueeze(1)  # [num_anchors, 2]
-        
-        # 가장 가까운 anchor 찾기
-        dist = ((anchor_px[:, 0] - cx) ** 2 + (anchor_px[:, 1] - cy) ** 2)
-        nearest_idx = dist.argmin().item()
-        
-        # 해당 anchor의 feature
-        feature = region_features[:, nearest_idx].cpu().numpy()
-        
-        return feature
-
-
-# =============================================================================
-# MobileCLIP Attribute Embedding Builder
-# =============================================================================
-
-class MobileCLIPAttributeEmbeddings:
-    """
-    MobileCLIP text encoder로 attribute embeddings 생성
-    
-    YOLOE가 사용하는 것과 동일한 MobileCLIP 임베딩 공간
+    MobileCLIP 모델 로드 없이 미리 생성된 embeddings만 사용
     """
     
-    # Attribute view 템플릿 (K개 view)
+    # Attribute view 템플릿 (캐시 생성 시 사용된 것과 동일해야 함)
     ATTRIBUTE_VIEWS = {
         "base": "a photo of a {cls}",
         "material_metal": "a {cls} made of metal",
@@ -135,7 +79,7 @@ class MobileCLIPAttributeEmbeddings:
         "context_outdoor": "a {cls} outdoors",
     }
     
-    # Depiction/Real 프롬프트 (artifactness용)
+    # Depiction/Real 프롬프트
     DEPICTION_PROMPTS = [
         "a toy", "a toy version", "a statue", "a sculpture",
         "a poster", "a painting", "a drawing", "a figurine",
@@ -148,11 +92,15 @@ class MobileCLIPAttributeEmbeddings:
         "a living thing", "an actual object",
     ]
     
-    def __init__(self, class_names: Dict[int, str], device: str = "cuda"):
+    def __init__(self, 
+                 class_names: Dict[int, str],
+                 cache_dir: str = "tools/mobileclip_blt",
+                 device: str = "cuda"):
         self.class_names = class_names
+        self.cache_dir = Path(cache_dir)
         self.device = device
         
-        # 클래스 이름 리스트
+        # 클래스 이름 리스트 (정렬된 순서)
         self.sorted_class_indices = sorted(class_names.keys())
         self.sorted_class_names = [class_names[i] for i in self.sorted_class_indices]
         self.num_classes = len(self.sorted_class_names)
@@ -161,306 +109,373 @@ class MobileCLIPAttributeEmbeddings:
         self.view_names = [k for k in self.ATTRIBUTE_VIEWS.keys() if k != "base"]
         self.num_views = len(self.view_names)
         
-        # MobileCLIP text encoder
-        self.text_model = None
-        self.tokenizer = None
-        
         # Embeddings
-        self.base_embeddings = None      # [num_classes, embed]
-        self.view_embeddings = {}        # {view_name: [num_classes, embed]}
-        self.depiction_embeddings = None # [len(DEPICTION_PROMPTS), embed]
-        self.real_embeddings = None      # [len(REAL_PROMPTS), embed]
+        self.base_embeddings = None      # [num_classes, embed_dim]
+        self.view_embeddings = {}        # {view_name: [num_classes, embed_dim]}
+        self.depiction_embeddings = None
+        self.real_embeddings = None
         
-        self._load_mobileclip_text()
-        self._build_embeddings()
-    
-    def _load_mobileclip_text(self):
-        """MobileCLIP text encoder 로드 (YOLOE와 동일)"""
-        try:
-            from ultralytics.nn.text_model import build_text_model
-            
-            self.text_model = build_text_model("mobileclip:blt", device=self.device)
-            self.text_model.eval()
-            self.tokenizer = self.text_model.tokenize
-            print(f"  Loaded MobileCLIP text encoder (via YOLOE's build_text_model)")
-            
-        except Exception as e:
-            print(f"  ERROR: Failed to load MobileCLIP text encoder: {e}")
+        self._load_or_generate_embeddings()
     
     def _clean_class_name(self, name: str) -> str:
         """클래스 이름 정리"""
         return name.split("/")[0].strip().replace("_", " ")
     
-    @torch.no_grad()
-    def _encode_texts(self, texts: List[str]) -> np.ndarray:
-        """텍스트 인코딩"""
-        if self.text_model is None:
-            return None
+    def _load_or_generate_embeddings(self):
+        """캐시 로드 또는 생성"""
+        label_cache = self.cache_dir / "lvis_label_embeddings.pt"
+        attr_cache = self.cache_dir / "lvis_attribute_embeddings.pt"
+        art_cache = self.cache_dir / "artifactness_embeddings.pt"
         
-        tokens = self.tokenizer(texts)
-        features = self.text_model.encode_text(tokens)
-        features = F.normalize(features, dim=-1)
-        
-        return features.cpu().numpy()
+        # 캐시 존재 여부 확인
+        if label_cache.exists() and attr_cache.exists():
+            print(f"  Loading cached embeddings from {self.cache_dir}")
+            self._load_from_cache(label_cache, attr_cache, art_cache)
+        else:
+            print(f"  Cache not found at {self.cache_dir}")
+            print(f"  Generating embeddings using YOLOE's text model...")
+            self._generate_embeddings()
     
-    def _build_embeddings(self):
-        """모든 embeddings 생성"""
-        if self.text_model is None:
-            print("  ERROR: Text model not loaded")
-            return
+    def _load_from_cache(self, label_cache: Path, attr_cache: Path, art_cache: Path):
+        """캐시에서 로드"""
+        # Label embeddings (base view)
+        label_emb = torch.load(label_cache, map_location=self.device)
+        # label_emb는 {class_name: embedding} 또는 tensor 형태일 수 있음
         
-        print(f"\n  Building MobileCLIP embeddings for {self.num_classes} classes, {self.num_views} views...")
+        if isinstance(label_emb, dict):
+            # {name: emb} 형태
+            base_list = []
+            for name in self.sorted_class_names:
+                clean = self._clean_class_name(name)
+                prompt = self.ATTRIBUTE_VIEWS["base"].format(cls=clean)
+                if prompt in label_emb:
+                    base_list.append(label_emb[prompt].cpu().numpy())
+                elif clean in label_emb:
+                    base_list.append(label_emb[clean].cpu().numpy())
+                else:
+                    # fallback: 0 벡터
+                    base_list.append(np.zeros(512))
+            self.base_embeddings = np.stack(base_list)
+        else:
+            # tensor 형태 [num_classes, embed_dim]
+            self.base_embeddings = label_emb.cpu().numpy()
         
-        clean_names = [self._clean_class_name(n) for n in self.sorted_class_names]
-        
-        # Base embeddings
-        base_texts = [self.ATTRIBUTE_VIEWS["base"].format(cls=n) for n in clean_names]
-        self.base_embeddings = self._encode_texts(base_texts)
         print(f"    Base embeddings: {self.base_embeddings.shape}")
         
-        # View embeddings
+        # Attribute embeddings (각 view)
+        attr_emb = torch.load(attr_cache, map_location=self.device)
+        
+        if isinstance(attr_emb, dict):
+            for view_name in self.view_names:
+                template = self.ATTRIBUTE_VIEWS[view_name]
+                view_list = []
+                for name in self.sorted_class_names:
+                    clean = self._clean_class_name(name)
+                    prompt = template.format(cls=clean)
+                    if prompt in attr_emb:
+                        view_list.append(attr_emb[prompt].cpu().numpy())
+                    else:
+                        view_list.append(np.zeros(512))
+                self.view_embeddings[view_name] = np.stack(view_list)
+        
+        print(f"    View embeddings: {len(self.view_embeddings)} views")
+        
+        # Artifactness embeddings
+        if art_cache.exists():
+            art_emb = torch.load(art_cache, map_location=self.device)
+            if isinstance(art_emb, dict):
+                dep_list = [art_emb[p].cpu().numpy() for p in self.DEPICTION_PROMPTS if p in art_emb]
+                real_list = [art_emb[p].cpu().numpy() for p in self.REAL_PROMPTS if p in art_emb]
+                if dep_list:
+                    self.depiction_embeddings = np.stack(dep_list)
+                if real_list:
+                    self.real_embeddings = np.stack(real_list)
+            print(f"    Artifactness embeddings loaded")
+    
+    def _generate_embeddings(self):
+        """YOLOE의 text model로 embeddings 생성"""
+        try:
+            from ultralytics.nn.text_model import build_text_model
+            
+            print(f"  Building text model...")
+            text_model = build_text_model("mobileclip:blt", device=self.device)
+            text_model.eval()
+            
+            clean_names = [self._clean_class_name(n) for n in self.sorted_class_names]
+            
+            with torch.no_grad():
+                # Base embeddings
+                base_texts = [self.ATTRIBUTE_VIEWS["base"].format(cls=n) for n in clean_names]
+                base_tokens = text_model.tokenize(base_texts)
+                base_feats = text_model.encode_text(base_tokens)
+                base_feats = F.normalize(base_feats, dim=-1)
+                self.base_embeddings = base_feats.cpu().numpy()
+                print(f"    Base embeddings: {self.base_embeddings.shape}")
+                
+                # View embeddings
+                for view_name in self.view_names:
+                    template = self.ATTRIBUTE_VIEWS[view_name]
+                    view_texts = [template.format(cls=n) for n in clean_names]
+                    view_tokens = text_model.tokenize(view_texts)
+                    view_feats = text_model.encode_text(view_tokens)
+                    view_feats = F.normalize(view_feats, dim=-1)
+                    self.view_embeddings[view_name] = view_feats.cpu().numpy()
+                print(f"    View embeddings: {len(self.view_embeddings)} views")
+                
+                # Depiction/Real embeddings
+                dep_tokens = text_model.tokenize(self.DEPICTION_PROMPTS)
+                dep_feats = text_model.encode_text(dep_tokens)
+                dep_feats = F.normalize(dep_feats, dim=-1)
+                self.depiction_embeddings = dep_feats.cpu().numpy()
+                
+                real_tokens = text_model.tokenize(self.REAL_PROMPTS)
+                real_feats = text_model.encode_text(real_tokens)
+                real_feats = F.normalize(real_feats, dim=-1)
+                self.real_embeddings = real_feats.cpu().numpy()
+                print(f"    Artifactness embeddings generated")
+            
+            # 캐시 저장
+            self._save_cache()
+            
+        except Exception as e:
+            print(f"  ERROR: Failed to generate embeddings: {e}")
+            # Fallback: 빈 embeddings
+            self.base_embeddings = np.zeros((self.num_classes, 512))
+            for view_name in self.view_names:
+                self.view_embeddings[view_name] = np.zeros((self.num_classes, 512))
+    
+    def _save_cache(self):
+        """캐시 저장"""
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 저장 형식: {prompt: embedding}
+        clean_names = [self._clean_class_name(n) for n in self.sorted_class_names]
+        
+        # Label embeddings
+        label_dict = {}
+        for i, name in enumerate(clean_names):
+            prompt = self.ATTRIBUTE_VIEWS["base"].format(cls=name)
+            label_dict[prompt] = torch.from_numpy(self.base_embeddings[i])
+        torch.save(label_dict, self.cache_dir / "lvis_label_embeddings.pt")
+        
+        # Attribute embeddings
+        attr_dict = {}
         for view_name in self.view_names:
             template = self.ATTRIBUTE_VIEWS[view_name]
-            view_texts = [template.format(cls=n) for n in clean_names]
-            self.view_embeddings[view_name] = self._encode_texts(view_texts)
+            for i, name in enumerate(clean_names):
+                prompt = template.format(cls=name)
+                attr_dict[prompt] = torch.from_numpy(self.view_embeddings[view_name][i])
+        torch.save(attr_dict, self.cache_dir / "lvis_attribute_embeddings.pt")
         
-        print(f"    View embeddings: {self.num_views} views x {self.num_classes} classes")
+        # Artifactness embeddings
+        art_dict = {}
+        if self.depiction_embeddings is not None:
+            for i, p in enumerate(self.DEPICTION_PROMPTS):
+                art_dict[p] = torch.from_numpy(self.depiction_embeddings[i])
+        if self.real_embeddings is not None:
+            for i, p in enumerate(self.REAL_PROMPTS):
+                art_dict[p] = torch.from_numpy(self.real_embeddings[i])
+        torch.save(art_dict, self.cache_dir / "artifactness_embeddings.pt")
         
-        # Depiction/Real embeddings
-        self.depiction_embeddings = self._encode_texts(self.DEPICTION_PROMPTS)
-        self.real_embeddings = self._encode_texts(self.REAL_PROMPTS)
-        print(f"    Depiction: {self.depiction_embeddings.shape}, Real: {self.real_embeddings.shape}")
+        print(f"  Saved embeddings cache to {self.cache_dir}")
 
 
 # =============================================================================
-# Semantic Uncertainty Calculator (YOLOE region feature 기반)
+# Semantic Uncertainty Calculator
 # =============================================================================
 
 class SemanticUncertaintyCalculator:
     """
-    Semantic Uncertainty 계산기 (YOLOE region feature + MobileCLIP embeddings)
+    Semantic Uncertainty 계산기
     
-    파이프라인:
-    1. YOLOE head에서 region feature 캡처 (512-dim)
-    2. bbox 중심에 해당하는 anchor 위치의 feature 추출
-    3. MobileCLIP attribute embeddings과 matmul → view별 posterior
-    4. JS(p^(1), ..., p^(K)) = u_sem
+    사용하는 것:
+    - detection.region_feature (YOLOE cv3 output, fuse 전 캡처)
+    - 캐시된 MobileCLIP text embeddings
+    
+    계산:
+    - region_feature · base_embeddings → top-M 클래스 선택
+    - region_feature · view_embeddings[k] → view별 posterior
+    - JS(posteriors) = u_sem
     """
     
     def __init__(self,
-                 model,
                  class_names: Dict[int, str],
                  device: str = "cuda",
                  temperature: float = 10.0,
-                 top_m: int = 20):
-        self.model = model
+                 top_m: int = 20,
+                 cache_dir: str = "tools/mobileclip_blt"):
         self.class_names = class_names
         self.device = device
         self.temperature = temperature
         self.top_m = top_m
         
-        # Region feature extractor
-        self.feature_extractor = YOLOERegionFeatureExtractor(model, device)
-        
-        # MobileCLIP attribute embeddings
-        self.attr_emb = MobileCLIPAttributeEmbeddings(class_names, device)
+        # 캐시된 embeddings 로드
+        print(f"\n--- Loading/Generating Embeddings ---")
+        self.emb = CachedEmbeddings(class_names, cache_dir, device)
         
         print(f"    Temperature: {self.temperature}, Top-M: {self.top_m}")
     
-    def compute_for_detection(self, detection: Detection, 
-                               img_shape: Tuple[int, int],
-                               debug: bool = False) -> Tuple[float, Optional[np.ndarray], Dict]:
+    def compute_u_sem(self, region_feature: np.ndarray) -> float:
         """
-        단일 detection의 u_sem 계산
+        단일 region feature의 u_sem 계산
         
         Args:
-            detection: Detection 객체
-            img_shape: (H, W) 이미지 크기
-            debug: True면 디버그 정보 반환
+            region_feature: [512] anchor feature
         
         Returns:
-            (u_sem, region_feature, debug_info)
+            u_sem 값
         """
-        debug_info = {"status": "ok", "drop_reason": None}
+        if region_feature is None or self.emb.base_embeddings is None:
+            return 0.0
         
-        # 1. Region feature 추출
-        region_feat = self.feature_extractor.get_feature_for_bbox(detection.bbox, img_shape)
-        
-        if region_feat is None:
-            debug_info = {"status": "dropped", "drop_reason": "no_region_feature"}
-            return 0.0, None, debug_info
-        
-        if self.attr_emb.base_embeddings is None:
-            debug_info = {"status": "dropped", "drop_reason": "no_embeddings"}
-            return 0.0, None, debug_info
-        
-        # 2. Base posterior → Top-M 클래스
-        # region_feat: [embed], base_embeddings: [num_classes, embed]
-        base_logits = np.dot(self.attr_emb.base_embeddings, region_feat) / self.temperature
+        # 1. Base posterior → Top-M 클래스
+        base_logits = np.dot(self.emb.base_embeddings, region_feature) / self.temperature
         base_posterior = softmax(base_logits)
         
         # Top-M 클래스 인덱스
         top_m_indices = np.argsort(base_posterior)[-self.top_m:]
-        top_m_probs = base_posterior[top_m_indices]
         
-        if debug:
-            top_m_names = [self.attr_emb.sorted_class_names[i] for i in top_m_indices[-5:]]
-            debug_info["top5_base"] = list(zip(top_m_names, top_m_probs[-5:].tolist()))
-        
-        # 3. 각 view의 posterior (Top-M만)
+        # 2. 각 view의 posterior (Top-M만)
         posteriors = []
-        view_top5s = {}
-        
-        for view_name in self.attr_emb.view_names:
-            view_emb = self.attr_emb.view_embeddings[view_name]
+        for view_name in self.emb.view_names:
+            view_emb = self.emb.view_embeddings.get(view_name)
+            if view_emb is None:
+                continue
             
             # Top-M 클래스만
-            top_m_emb = view_emb[top_m_indices]  # [M, embed]
+            top_m_emb = view_emb[top_m_indices]  # [M, 512]
             
             # Logits & softmax (Top-M 내에서)
-            logits = np.dot(top_m_emb, region_feat) / self.temperature
+            logits = np.dot(top_m_emb, region_feature) / self.temperature
             posterior = softmax(logits)  # [M]
             posteriors.append(posterior)
-            
-            if debug:
-                view_ranking = np.argsort(posterior)[-5:]
-                view_top5s[view_name] = [
-                    (self.attr_emb.sorted_class_names[top_m_indices[i]], posterior[i])
-                    for i in view_ranking
-                ]
+        
+        if len(posteriors) < 2:
+            return 0.0
         
         posteriors = np.stack(posteriors, axis=0)  # [K, M]
         
-        if debug:
-            debug_info["view_top5s"] = view_top5s
-        
-        # 4. JS divergence
-        u_sem = js_divergence(posteriors)
-        debug_info["u_sem"] = u_sem
-        
-        return u_sem, region_feat, debug_info
+        # 3. JS divergence
+        return js_divergence(posteriors)
     
-    def compute_artifactness(self, region_feat: np.ndarray) -> float:
+    def compute_artifactness(self, region_feature: np.ndarray) -> float:
         """
-        Region feature의 artifactness score 계산
+        Artifactness score 계산
         
         Returns:
             margin = max(depiction_sim) - max(real_sim)
         """
-        if region_feat is None:
+        if region_feature is None:
+            return 0.0
+        if self.emb.depiction_embeddings is None or self.emb.real_embeddings is None:
             return 0.0
         
-        if self.attr_emb.depiction_embeddings is None:
-            return 0.0
-        
-        dep_sims = np.dot(self.attr_emb.depiction_embeddings, region_feat)
-        real_sims = np.dot(self.attr_emb.real_embeddings, region_feat)
+        dep_sims = np.dot(self.emb.depiction_embeddings, region_feature)
+        real_sims = np.dot(self.emb.real_embeddings, region_feature)
         
         return float(np.max(dep_sims) - np.max(real_sims))
     
-    def run_inference_and_compute(self, 
-                                   image_path: str,
-                                   detections: List[Detection],
-                                   verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], Dict]:
+    def compute_for_detection(self, detection: Detection) -> Tuple[float, float, Dict]:
         """
-        이미지에 대해 YOLOE inference 후 u_sem, artifactness 계산
-        
-        Args:
-            image_path: 이미지 경로
-            detections: 해당 이미지의 detection 리스트
-            verbose: 진행상황 출력
+        단일 detection의 u_sem, s_art 계산
         
         Returns:
-            (u_sems, s_arts, region_features, drop_stats)
+            (u_sem, s_art, debug_info)
         """
-        if not detections:
-            return np.array([]), np.array([]), [], {"total": 0, "valid": 0}
+        debug_info = {"status": "ok"}
         
-        # 1. YOLOE inference (region feature 캡처)
-        # 이미 detection phase에서 inference가 끝났으므로, 
-        # head에 저장된 _region_features를 사용
-        # 단, fuse 전에만 유효함
+        if detection.region_feature is None:
+            return 0.0, 0.0, {"status": "dropped", "reason": "no_region_feature"}
         
-        # 이미지 크기
-        img = Image.open(image_path)
-        img_shape = (img.height, img.width)
+        feat = detection.region_feature
+        u_sem = self.compute_u_sem(feat)
+        s_art = self.compute_artifactness(feat)
         
-        # 2. 각 detection에 대해 u_sem, artifactness 계산
+        return u_sem, s_art, debug_info
+    
+    def compute_for_detections(self, detections: List[Detection], 
+                               verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """
+        여러 detection의 u_sem, s_art 일괄 계산
+        
+        Returns:
+            (u_sem_array, s_art_array, drop_stats)
+        """
         u_sems = []
         s_arts = []
-        region_feats = []
         
-        drop_stats = {"total": len(detections), "valid": 0, "no_region_feature": 0, "no_embeddings": 0}
+        drop_stats = {
+            "total": len(detections),
+            "valid": 0,
+            "no_region_feature": 0,
+        }
         
-        for det in detections:
-            u_sem, feat, debug_info = self.compute_for_detection(det, img_shape)
-            art = self.compute_artifactness(feat) if feat is not None else 0.0
+        for i, det in enumerate(detections):
+            if verbose and (i + 1) % 100 == 0:
+                print(f"    Processing {i+1}/{len(detections)}...")
             
+            u_sem, s_art, info = self.compute_for_detection(det)
             u_sems.append(u_sem)
-            s_arts.append(art)
-            region_feats.append(feat)
+            s_arts.append(s_art)
             
-            if debug_info["status"] == "ok":
+            if info["status"] == "ok":
                 drop_stats["valid"] += 1
             else:
-                reason = debug_info.get("drop_reason", "unknown")
-                if "no_region_feature" in reason:
-                    drop_stats["no_region_feature"] += 1
-                elif "no_embeddings" in reason:
-                    drop_stats["no_embeddings"] += 1
+                drop_stats["no_region_feature"] += 1
         
-        return np.array(u_sems), np.array(s_arts), region_feats, drop_stats
+        if verbose:
+            print(f"    Drop stats: valid={drop_stats['valid']}/{drop_stats['total']}, "
+                  f"no_feature={drop_stats['no_region_feature']}")
+        
+        return np.array(u_sems), np.array(s_arts), drop_stats
     
-    def unit_test_single_detection(self, detection: Detection, img_shape: Tuple[int, int]):
+    def sanity_check(self, detection: Detection):
         """
-        단일 detection에 대한 유닛테스트 - view 간 차이 확인
+        Sanity check: posterior가 균등이 아닌지, u_sem이 의미 있는지 확인
         """
         print("\n" + "="*60)
-        print("U_SEM UNIT TEST (YOLOE Region Feature)")
+        print("SANITY CHECK")
         print("="*60)
         
-        u_sem, feat, debug_info = self.compute_for_detection(detection, img_shape, debug=True)
-        
-        print(f"Detection: {detection.pred_class_name} (conf={detection.confidence:.3f})")
-        print(f"Status: {debug_info['status']}")
-        
-        if debug_info['status'] != 'ok':
-            print(f"Drop reason: {debug_info['drop_reason']}")
+        if detection.region_feature is None:
+            print("ERROR: No region feature")
             return
         
-        print(f"Region feature shape: {feat.shape if feat is not None else 'None'}")
+        feat = detection.region_feature
+        print(f"Region feature: shape={feat.shape}, norm={np.linalg.norm(feat):.4f}")
+        
+        # Base posterior
+        base_logits = np.dot(self.emb.base_embeddings, feat) / self.temperature
+        base_posterior = softmax(base_logits)
+        
+        # Uniform vs actual
+        uniform_prob = 1.0 / len(base_posterior)
+        max_prob = np.max(base_posterior)
+        top5_idx = np.argsort(base_posterior)[-5:]
+        
+        print(f"\nBase posterior (temperature={self.temperature}):")
+        print(f"  Uniform prob: {uniform_prob:.6f}")
+        print(f"  Max prob: {max_prob:.6f}")
+        print(f"  Max/Uniform ratio: {max_prob/uniform_prob:.2f}x")
+        
+        if max_prob < uniform_prob * 2:
+            print("  WARNING: Posterior too uniform! Check temperature or feature normalization.")
+        
+        print(f"\nTop-5 classes:")
+        for idx in reversed(top5_idx):
+            name = self.emb.sorted_class_names[idx]
+            prob = base_posterior[idx]
+            print(f"    {name}: {prob:.6f}")
+        
+        # u_sem
+        u_sem = self.compute_u_sem(feat)
+        s_art = self.compute_artifactness(feat)
+        
         print(f"\nu_sem = {u_sem:.6f}")
+        print(f"s_art = {s_art:.6f}")
         
-        if feat is not None:
-            art = self.compute_artifactness(feat)
-            print(f"artifactness = {art:.6f}")
-        
-        print(f"\nBase view top-5:")
-        for name, prob in debug_info.get("top5_base", []):
-            print(f"  {name}: {prob:.4f}")
-        
-        print(f"\nPer-view top-5 (view별로 다르면 u_sem이 커야 함):")
-        view_top5s = debug_info.get("view_top5s", {})
-        for view_name, top5 in view_top5s.items():
-            print(f"\n  [{view_name}]")
-            for name, prob in top5:
-                print(f"    {name}: {prob:.4f}")
-        
-        # View 간 일치도 분석
-        print(f"\n분석:")
-        all_top1s = []
-        for view_name, top5 in view_top5s.items():
-            if top5:
-                all_top1s.append(top5[-1][0])
-        
-        unique_top1s = set(all_top1s)
-        print(f"  View별 top-1 클래스: {all_top1s}")
-        print(f"  Unique top-1 수: {len(unique_top1s)}/{len(all_top1s)}")
-        
-        if len(unique_top1s) == 1:
-            print(f"  → 모든 view가 동일한 top-1 → u_sem ≈ 0 정상")
-        else:
-            print(f"  → View마다 top-1이 다름 → u_sem > 0 예상")
+        if u_sem < 1e-4:
+            print("WARNING: u_sem very small. Views might be too similar.")
 
 
 # =============================================================================
@@ -473,16 +488,12 @@ class EnhancedTriadSplit:
     
     분류:
     - TP: True Positives
-    - Depiction_FP: artifactness score > threshold인 Semantic FP (H1 대상)
+    - Depiction_FP: artifactness score > threshold (H1 대상)
     - ClassConfusion_FP: 나머지 Semantic FP
     - Background_FP: GT와 매칭 안 됨
     """
     
     def __init__(self, depiction_threshold: float = 0.0):
-        """
-        Args:
-            depiction_threshold: artifactness score > threshold면 Depiction_FP
-        """
         self.depiction_threshold = depiction_threshold
     
     def split_detections(self, 
@@ -490,13 +501,6 @@ class EnhancedTriadSplit:
                          artifactness_scores: np.ndarray) -> Dict[str, List[Tuple[Detection, float]]]:
         """
         Detection 리스트를 4개 그룹으로 분할
-        
-        Args:
-            detections: Detection 리스트
-            artifactness_scores: 각 detection의 artifactness score
-        
-        Returns:
-            {group_name: [(Detection, artifactness_score), ...]}
         """
         groups = {
             "TP": [],
@@ -535,8 +539,14 @@ class EnhancedTriadSplit:
 # Backward compatibility
 # =============================================================================
 
+class YOLOERegionFeatureExtractor:
+    """Deprecated - region feature는 detection phase에서 직접 캡처"""
+    pass
+
+class MobileCLIPAttributeEmbeddings:
+    """Deprecated - CachedEmbeddings 사용"""
+    pass
+
 class MobileCLIPScorer:
-    """Backward compatibility - 이제 사용하지 않음"""
-    def __init__(self, device: str = "cuda"):
-        print("  WARNING: MobileCLIPScorer is deprecated. Use SemanticUncertaintyCalculator instead.")
-        self.model_name = "DEPRECATED"
+    """Deprecated"""
+    pass

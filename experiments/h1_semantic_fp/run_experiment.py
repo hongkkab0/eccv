@@ -533,32 +533,46 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (YOLOE region feature + MobileCLIP embeddings)
-    print("\n--- Semantic Uncertainty Calculation (YOLOE region feature) ---")
+    # 3.3 u_sem 계산 (캐시된 MobileCLIP embeddings + region feature)
+    print("\n--- Semantic Uncertainty Calculation ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
-        model=model,
         class_names=class_names,
         device=config.device,
         temperature=10.0,
         top_m=config.top_m_classes,
+        cache_dir="tools/mobileclip_blt",
     )
     
     # Region feature 유무 확인
     has_region_features = False
+    sample_feat = None
     for group_name, detections in matched_data.items():
         if isinstance(detections, list):
-            for det in detections[:10]:  # 샘플 체크
+            for det in detections[:10]:
                 if det.region_feature is not None:
                     has_region_features = True
+                    sample_feat = det.region_feature
                     break
             if has_region_features:
                 break
     
     if has_region_features:
-        print("  Region features available (fuse 전 캡처됨)")
+        print(f"  Region features available!")
+        print(f"  Sample feature: shape={sample_feat.shape}, norm={np.linalg.norm(sample_feat):.4f}")
     else:
-        print("  WARNING: Region features not available (model was fused)")
-        print("  u_sem will be computed from stored features if available")
+        print("  WARNING: No region features found.")
+        print("  Check if model is fused - fused models don't provide 512-dim features.")
+    
+    # Sanity check (첫 번째 샘플)
+    if has_region_features:
+        print("\n--- Sanity Check ---")
+        for group_name, detections in matched_data.items():
+            if isinstance(detections, list):
+                for det in detections:
+                    if det.region_feature is not None:
+                        u_sem_calculator.sanity_check(det)
+                        break
+                break
     
     # u_sem, artifactness 계산
     u_sem_by_group = {}
@@ -570,54 +584,11 @@ def run_evaluation_phase(config: ExperimentConfig,
             continue
         
         print(f"\n  Computing u_sem for {group_name} ({len(detections)} samples)...")
+        u_sems, s_arts, drop_stats = u_sem_calculator.compute_for_detections(detections, verbose=True)
         
-        u_sems = []
-        s_arts = []
-        valid_count = 0
-        no_feature_count = 0
-        
-        for det in detections:
-            if det.region_feature is not None:
-                # region feature가 있으면 직접 계산
-                feat = det.region_feature
-                
-                # u_sem: Top-M gating + JS
-                base_logits = np.dot(u_sem_calculator.attr_emb.base_embeddings, feat) / u_sem_calculator.temperature
-                base_posterior = softmax(base_logits)
-                top_m_indices = np.argsort(base_posterior)[-u_sem_calculator.top_m:]
-                
-                posteriors = []
-                for view_name in u_sem_calculator.attr_emb.view_names:
-                    view_emb = u_sem_calculator.attr_emb.view_embeddings[view_name]
-                    top_m_emb = view_emb[top_m_indices]
-                    logits = np.dot(top_m_emb, feat) / u_sem_calculator.temperature
-                    posteriors.append(softmax(logits))
-                
-                posteriors = np.stack(posteriors, axis=0)
-                u_sem = js_divergence(posteriors)
-                
-                # artifactness
-                dep_sims = np.dot(u_sem_calculator.attr_emb.depiction_embeddings, feat)
-                real_sims = np.dot(u_sem_calculator.attr_emb.real_embeddings, feat)
-                s_art = float(np.max(dep_sims) - np.max(real_sims))
-                
-                u_sems.append(u_sem)
-                s_arts.append(s_art)
-                valid_count += 1
-            else:
-                u_sems.append(0.0)
-                s_arts.append(0.0)
-                no_feature_count += 1
-        
-        u_sem_by_group[group_name] = np.array(u_sems)
-        s_art_by_group[group_name] = np.array(s_arts)
-        drop_stats_by_group[group_name] = {
-            "total": len(detections),
-            "valid": valid_count,
-            "no_region_feature": no_feature_count,
-        }
-        
-        print(f"    Valid: {valid_count}/{len(detections)}, no_feature: {no_feature_count}")
+        u_sem_by_group[group_name] = u_sems
+        s_art_by_group[group_name] = s_arts
+        drop_stats_by_group[group_name] = drop_stats
     
     # u_sem 통계
     print(f"\n  u_sem statistics:")
@@ -936,6 +907,16 @@ def main():
     model = YOLOE(config.checkpoint)
     model.to(config.device)
     model.eval()
+    
+    # fuse 상태 확인
+    head = model.model.model[-1]
+    if hasattr(head, 'is_fused') and head.is_fused:
+        print(f"  WARNING: Model head is already fused.")
+        print(f"  Region features (512-dim) cannot be extracted from fused model.")
+        print(f"  u_sem calculation will be skipped or use fallback.")
+    else:
+        print(f"  Model head is NOT fused - region features available.")
+        print(f"  embed_dim: {head.embed if hasattr(head, 'embed') else 'unknown'}")
     
     # Phase 1: Detection
     if not args.skip_detection:
