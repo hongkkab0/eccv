@@ -342,12 +342,17 @@ class SemanticUncertaintyCalculator:
         
         return float(h / h_max) if h_max > 0 else 0.0
     
-    def compute_u_sem(self, region_feature: np.ndarray) -> float:
+    def compute_u_sem(self, region_feature: np.ndarray, cls_logits: np.ndarray = None) -> float:
         """
-        단일 region feature의 u_sem 계산 (unfused 모델용)
+        캘리브레이션된 u_sem 계산
+        
+        핵심: cls_logits의 스케일에 맞춰서 view posterior를 계산
+        - cls_logits가 있으면: 스케일 캘리브레이션 적용
+        - cls_logits가 없으면: 기존 방식 (temperature 사용)
         
         Args:
-            region_feature: [512] anchor feature
+            region_feature: [512] anchor feature (L2 normalized됨)
+            cls_logits: [nc] pre-sigmoid logits from YOLOE head
         
         Returns:
             u_sem 값
@@ -355,15 +360,39 @@ class SemanticUncertaintyCalculator:
         if region_feature is None or self.emb.base_embeddings is None:
             return 0.0
         
-        # 1. Base posterior → Top-M 클래스
-        base_logits = np.dot(self.emb.base_embeddings, region_feature) / self.temperature
+        # ===== Step 1: region feature L2 normalize =====
+        region_norm = region_feature / (np.linalg.norm(region_feature) + 1e-8)
+        
+        # ===== Step 2: base posterior (cls_logits 또는 dot-product) =====
+        if cls_logits is not None:
+            # cls_logits가 있으면 그대로 사용 (YOLOE 스케일)
+            base_logits = cls_logits
+            
+            # 스케일 캘리브레이션: alpha = (sim · logits) / (sim · sim)
+            # normalized dot-product로 raw similarity 계산
+            raw_sim = np.dot(self.emb.base_embeddings, region_norm)  # [nc]
+            
+            # alpha 계산 (least squares)
+            sim_flat = raw_sim.flatten()
+            logits_flat = base_logits.flatten()
+            alpha = np.dot(sim_flat, logits_flat) / (np.dot(sim_flat, sim_flat) + 1e-8)
+            alpha = max(alpha, 1.0)  # alpha가 너무 작으면 클리핑
+        else:
+            # cls_logits가 없으면 기존 방식
+            base_logits = np.dot(self.emb.base_embeddings, region_norm) / self.temperature
+            alpha = 1.0 / self.temperature
+        
         base_posterior = softmax(base_logits)
         
         # Top-M 클래스 인덱스
         top_m_indices = np.argsort(base_posterior)[-self.top_m:]
         
-        # 2. 각 view의 posterior (Top-M만)
-        posteriors = []
+        # ===== Step 3: base view posterior (Top-M만) =====
+        # base view도 posteriors에 포함
+        base_top_m_logits = base_logits[top_m_indices]
+        posteriors = [softmax(base_top_m_logits)]
+        
+        # ===== Step 4: 각 attribute view의 posterior (Top-M만, 캘리브레이션된 스케일) =====
         for view_name in self.emb.view_names:
             view_emb = self.emb.view_embeddings.get(view_name)
             if view_emb is None:
@@ -372,17 +401,19 @@ class SemanticUncertaintyCalculator:
             # Top-M 클래스만
             top_m_emb = view_emb[top_m_indices]  # [M, 512]
             
-            # Logits & softmax (Top-M 내에서)
-            logits = np.dot(top_m_emb, region_feature) / self.temperature
-            posterior = softmax(logits)  # [M]
+            # normalized dot-product → alpha로 스케일 맞춤
+            raw_sim_view = np.dot(top_m_emb, region_norm)  # [M]
+            logits_view = alpha * raw_sim_view
+            
+            posterior = softmax(logits_view)  # [M]
             posteriors.append(posterior)
         
         if len(posteriors) < 2:
             return 0.0
         
-        posteriors = np.stack(posteriors, axis=0)  # [K, M]
+        posteriors = np.stack(posteriors, axis=0)  # [K+1, M] (base + K views)
         
-        # 3. JS divergence
+        # ===== Step 5: JS divergence =====
         return js_divergence(posteriors)
     
     def compute_artifactness(self, region_feature: np.ndarray) -> float:
@@ -407,31 +438,41 @@ class SemanticUncertaintyCalculator:
         단일 detection의 u_sem, s_art 계산
         
         우선순위:
-        1. region_feature가 있으면: full u_sem (JS divergence) + artifactness
-        2. cls_logits만 있으면: entropy-based uncertainty + artifactness=0
-        3. 둘 다 없으면: drop
+        1. region_feature + cls_logits: 캘리브레이션된 u_sem (best)
+        2. region_feature만: temperature 기반 u_sem
+        3. cls_logits만: entropy-based uncertainty
+        4. 둘 다 없으면: drop
         
         Returns:
             (u_sem, s_art, debug_info)
         """
         debug_info = {"status": "ok", "source": "none"}
         
-        # 1. region_feature가 있으면 (unfused 모델)
+        # 1. region_feature + cls_logits (best: 캘리브레이션된 스케일)
+        if detection.region_feature is not None and detection.cls_logits is not None:
+            feat = detection.region_feature
+            logits = detection.cls_logits
+            u_sem = self.compute_u_sem(feat, logits)
+            s_art = self.compute_artifactness(feat)
+            debug_info["source"] = "region_feature+cls_logits"
+            return u_sem, s_art, debug_info
+        
+        # 2. region_feature만 (cls_logits 없음)
         if detection.region_feature is not None:
             feat = detection.region_feature
-            u_sem = self.compute_u_sem(feat)
+            u_sem = self.compute_u_sem(feat, None)
             s_art = self.compute_artifactness(feat)
             debug_info["source"] = "region_feature"
             return u_sem, s_art, debug_info
         
-        # 2. cls_logits만 있으면 (fused 모델)
+        # 3. cls_logits만 있으면 (fused 모델)
         if detection.cls_logits is not None:
             u_sem = self.compute_u_sem_from_logits(detection.cls_logits)
             s_art = 0.0  # fused 모델에서는 artifactness 계산 불가
             debug_info["source"] = "cls_logits"
             return u_sem, s_art, debug_info
         
-        # 3. 둘 다 없으면 drop
+        # 4. 둘 다 없으면 drop
         return 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
     
     def compute_for_detections(self, detections: List[Detection], 
@@ -463,9 +504,10 @@ class SemanticUncertaintyCalculator:
             
             if info["status"] == "ok":
                 drop_stats["valid"] += 1
-                if info.get("source") == "region_feature":
+                source = info.get("source", "")
+                if "region_feature" in source:
                     drop_stats["from_region_feature"] += 1
-                elif info.get("source") == "cls_logits":
+                elif source == "cls_logits":
                     drop_stats["from_cls_logits"] += 1
             else:
                 drop_stats["dropped"] += 1
@@ -481,9 +523,10 @@ class SemanticUncertaintyCalculator:
     def sanity_check(self, detection: Detection):
         """
         Sanity check: posterior가 균등이 아닌지, u_sem이 의미 있는지 확인
+        캘리브레이션 효과 비교
         """
         print("\n" + "="*60)
-        print("SANITY CHECK")
+        print("SANITY CHECK (with calibration)")
         print("="*60)
         
         if detection.region_feature is None:
@@ -491,40 +534,68 @@ class SemanticUncertaintyCalculator:
             return
         
         feat = detection.region_feature
+        cls_logits = detection.cls_logits
+        
         print(f"Region feature: shape={feat.shape}, norm={np.linalg.norm(feat):.4f}")
+        if cls_logits is not None:
+            print(f"Cls logits: shape={cls_logits.shape}, min={cls_logits.min():.2f}, max={cls_logits.max():.2f}")
         
-        # Base posterior
-        base_logits = np.dot(self.emb.base_embeddings, feat) / self.temperature
-        base_posterior = softmax(base_logits)
+        # L2 normalize
+        feat_norm = feat / (np.linalg.norm(feat) + 1e-8)
         
-        # Uniform vs actual
-        uniform_prob = 1.0 / len(base_posterior)
-        max_prob = np.max(base_posterior)
-        top5_idx = np.argsort(base_posterior)[-5:]
+        # ===== 방법 1: 기존 (temperature만) =====
+        base_logits_old = np.dot(self.emb.base_embeddings, feat_norm) / self.temperature
+        base_posterior_old = softmax(base_logits_old)
         
-        print(f"\nBase posterior (temperature={self.temperature}):")
+        uniform_prob = 1.0 / len(base_posterior_old)
+        max_prob_old = np.max(base_posterior_old)
+        
+        print(f"\n[OLD] temperature={self.temperature}:")
         print(f"  Uniform prob: {uniform_prob:.6f}")
-        print(f"  Max prob: {max_prob:.6f}")
-        print(f"  Max/Uniform ratio: {max_prob/uniform_prob:.2f}x")
+        print(f"  Max prob: {max_prob_old:.6f}")
+        print(f"  Max/Uniform ratio: {max_prob_old/uniform_prob:.2f}x")
         
-        if max_prob < uniform_prob * 2:
-            print("  WARNING: Posterior too uniform! Check temperature or feature normalization.")
+        # ===== 방법 2: 캘리브레이션 (cls_logits 기준) =====
+        if cls_logits is not None:
+            # alpha 계산
+            raw_sim = np.dot(self.emb.base_embeddings, feat_norm)
+            alpha = np.dot(raw_sim, cls_logits) / (np.dot(raw_sim, raw_sim) + 1e-8)
+            alpha = max(alpha, 1.0)
+            
+            # cls_logits를 base posterior로 사용
+            base_posterior_new = softmax(cls_logits)
+            max_prob_new = np.max(base_posterior_new)
+            
+            print(f"\n[NEW] calibrated (alpha={alpha:.2f}):")
+            print(f"  Max prob: {max_prob_new:.6f}")
+            print(f"  Max/Uniform ratio: {max_prob_new/uniform_prob:.2f}x")
+            print(f"  Improvement: {max_prob_new/max_prob_old:.2f}x sharper")
+            
+            top5_idx = np.argsort(base_posterior_new)[-5:]
+        else:
+            top5_idx = np.argsort(base_posterior_old)[-5:]
+            print("\n  (No cls_logits - using old method)")
         
         print(f"\nTop-5 classes:")
+        posterior_to_show = softmax(cls_logits) if cls_logits is not None else base_posterior_old
         for idx in reversed(top5_idx):
             name = self.emb.sorted_class_names[idx]
-            prob = base_posterior[idx]
+            prob = posterior_to_show[idx]
             print(f"    {name}: {prob:.6f}")
         
-        # u_sem
-        u_sem = self.compute_u_sem(feat)
+        # u_sem 비교
+        u_sem_old = self.compute_u_sem(feat, None)
+        u_sem_new = self.compute_u_sem(feat, cls_logits) if cls_logits is not None else u_sem_old
         s_art = self.compute_artifactness(feat)
         
-        print(f"\nu_sem = {u_sem:.6f}")
-        print(f"s_art = {s_art:.6f}")
+        print(f"\nu_sem (old): {u_sem_old:.6f}")
+        print(f"u_sem (calibrated): {u_sem_new:.6f}")
+        print(f"s_art: {s_art:.6f}")
         
-        if u_sem < 1e-4:
-            print("WARNING: u_sem very small. Views might be too similar.")
+        if cls_logits is not None and u_sem_new > u_sem_old * 1.5:
+            print("OK: Calibration improved u_sem significantly")
+        elif u_sem_new < 1e-3:
+            print("WARNING: u_sem still very small even with calibration")
 
 
 # =============================================================================
@@ -582,6 +653,145 @@ class EnhancedTriadSplit:
                       f"mean_art={np.mean(scores):.4f}, std={np.std(scores):.4f}")
             else:
                 print(f"    {name}: 0 detections")
+
+
+# =============================================================================
+# Semantic FP 재분해: Near-miss vs Hard-negative
+# =============================================================================
+
+class SemanticFPSplitter:
+    """
+    Semantic FP를 pred/gt 텍스트 유사도 기준으로 분해
+    
+    Near-miss FP: pred와 gt가 의미적으로 유사 (chair vs armchair)
+    Hard-negative FP: pred와 gt가 의미적으로 다름 (chair vs table)
+    """
+    
+    def __init__(self, 
+                 class_embeddings: np.ndarray,  # [nc, 512]
+                 class_names: Dict[int, str],
+                 near_miss_threshold: float = 0.7,  # cosine similarity
+                 hard_negative_threshold: float = 0.3):
+        """
+        Args:
+            class_embeddings: 클래스별 텍스트 임베딩
+            class_names: {idx: name}
+            near_miss_threshold: 이 이상이면 near-miss
+            hard_negative_threshold: 이 이하면 hard-negative
+        """
+        self.class_emb = class_embeddings
+        self.class_names = class_names
+        self.near_miss_threshold = near_miss_threshold
+        self.hard_negative_threshold = hard_negative_threshold
+        
+        # L2 normalize embeddings
+        norms = np.linalg.norm(self.class_emb, axis=1, keepdims=True)
+        self.class_emb_norm = self.class_emb / (norms + 1e-8)
+    
+    def get_class_similarity(self, class_a: int, class_b: int) -> float:
+        """두 클래스 간 코사인 유사도"""
+        if class_a >= len(self.class_emb_norm) or class_b >= len(self.class_emb_norm):
+            return 0.0
+        return float(np.dot(self.class_emb_norm[class_a], self.class_emb_norm[class_b]))
+    
+    def split_semantic_fps(self, 
+                           detections: List[Detection],
+                           u_sems: np.ndarray) -> Dict[str, List[Tuple[Detection, float]]]:
+        """
+        Semantic FP를 3가지로 분해
+        
+        Returns:
+            {
+                "NearMiss_FP": [(det, u_sem), ...],  # pred/gt 유사 (동의어/계층 충돌)
+                "HardNegative_FP": [(det, u_sem), ...],  # pred/gt 다름 (진짜 오류)
+                "Ambiguous_FP": [(det, u_sem), ...],  # 중간
+            }
+        """
+        groups = {
+            "NearMiss_FP": [],
+            "HardNegative_FP": [],
+            "Ambiguous_FP": [],
+        }
+        
+        for det, u_sem in zip(detections, u_sems):
+            # Semantic FP만 처리
+            if det.triad_label != "Semantic_FP":
+                continue
+            
+            # pred/gt 클래스 유사도 계산
+            pred_cls = det.pred_class
+            gt_cls = det.overlapping_gt_class if det.overlapping_gt_class is not None else det.matched_gt_class
+            
+            if gt_cls is None:
+                groups["Ambiguous_FP"].append((det, u_sem))
+                continue
+            
+            sim = self.get_class_similarity(pred_cls, gt_cls)
+            
+            if sim >= self.near_miss_threshold:
+                groups["NearMiss_FP"].append((det, u_sem))
+            elif sim <= self.hard_negative_threshold:
+                groups["HardNegative_FP"].append((det, u_sem))
+            else:
+                groups["Ambiguous_FP"].append((det, u_sem))
+        
+        return groups
+    
+    def print_split_stats(self, groups: Dict, u_sems: np.ndarray = None):
+        """Split 통계 출력"""
+        print("\n  Semantic FP Split (by pred/gt similarity):")
+        for name, items in groups.items():
+            if items:
+                u_vals = [u for _, u in items]
+                print(f"    {name}: {len(items)} detections")
+                print(f"      u_sem: mean={np.mean(u_vals):.4f}, std={np.std(u_vals):.4f}")
+                
+                # 예시 출력
+                if len(items) > 0:
+                    det, u = items[0]
+                    gt_cls = det.overlapping_gt_class if det.overlapping_gt_class is not None else det.matched_gt_class
+                    pred_name = self.class_names.get(det.pred_class, "?")
+                    gt_name = self.class_names.get(gt_cls, "?") if gt_cls is not None else "?"
+                    sim = self.get_class_similarity(det.pred_class, gt_cls) if gt_cls else 0
+                    print(f"      Example: {pred_name} vs {gt_name} (sim={sim:.2f})")
+            else:
+                print(f"    {name}: 0 detections")
+    
+    def get_confusion_matrix_subset(self, detections: List[Detection], top_k: int = 20):
+        """
+        가장 많이 혼동되는 클래스 쌍 반환
+        """
+        confusion_pairs = {}
+        
+        for det in detections:
+            if det.triad_label != "Semantic_FP":
+                continue
+            
+            pred_cls = det.pred_class
+            gt_cls = det.overlapping_gt_class if det.overlapping_gt_class is not None else det.matched_gt_class
+            
+            if gt_cls is None:
+                continue
+            
+            pair = (min(pred_cls, gt_cls), max(pred_cls, gt_cls))
+            confusion_pairs[pair] = confusion_pairs.get(pair, 0) + 1
+        
+        # 상위 K개 반환
+        sorted_pairs = sorted(confusion_pairs.items(), key=lambda x: -x[1])[:top_k]
+        
+        result = []
+        for (cls_a, cls_b), count in sorted_pairs:
+            name_a = self.class_names.get(cls_a, f"cls_{cls_a}")
+            name_b = self.class_names.get(cls_b, f"cls_{cls_b}")
+            sim = self.get_class_similarity(cls_a, cls_b)
+            result.append({
+                "classes": (cls_a, cls_b),
+                "names": (name_a, name_b),
+                "count": count,
+                "similarity": sim,
+            })
+        
+        return result
 
 
 # =============================================================================
