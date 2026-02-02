@@ -44,7 +44,9 @@ from .attribute_embeddings import (
 from .semantic_uncertainty import (
     SemanticUncertaintyCalculator,
     EnhancedTriadSplit,
+    js_divergence,
 )
+from scipy.special import softmax
 from .artifactness_score import ArtifactnessScorer
 from .h1_metrics import (
     H1Evaluator,
@@ -229,6 +231,14 @@ def run_detection_phase(config: ExperimentConfig,
     gt_class_counts = {}    # GT 클래스 분포
     mismatch_examples = []  # 불일치 예시 수집
     
+    # YOLOE head 참조 (region feature 추출용)
+    head = model.model.model[-1]
+    
+    # fuse 상태 확인 및 경고
+    if hasattr(head, 'is_fused') and head.is_fused:
+        print("  WARNING: Model is already fused. Region features will not be available.")
+        print("  To capture region features, use a non-fused model.")
+    
     for batch_idx, batch in enumerate(tqdm(dataloader, total=total_images)):
         if max_images and batch_idx >= max_images:
             break
@@ -241,6 +251,11 @@ def run_detection_phase(config: ExperimentConfig,
         # 추론
         with torch.no_grad():
             results = model.predict(imgs, verbose=False, conf=config.conf_threshold)
+        
+        # Region features 캡처 (fuse 전에만 유효)
+        region_features = None
+        if hasattr(head, '_region_features') and head._region_features is not None:
+            region_features = head._region_features[0].cpu()  # [embed, num_anchors]
         
         # 이미지 파일 경로 추출
         im_files = batch.get("im_file", [None] * len(results))
@@ -361,13 +376,34 @@ def run_detection_phase(config: ExperimentConfig,
                 
                 print(f"\n  IoU matrix stats: max={ious_debug.max().item():.3f}, mean={ious_debug.mean().item():.3f}")
             
-            # Logger에 전달 (image_path 포함 - Phase 3에서 attribute inference용)
+            # Detection별 region feature 추출 (bbox 중심에 가장 가까운 anchor)
+            det_region_features = None
+            if region_features is not None and hasattr(head, 'anchors') and head.anchors is not None:
+                anchors = head.anchors  # [2, num_anchors]
+                strides = head.strides  # [num_anchors]
+                
+                det_feats = []
+                for p_idx in range(len(pred_boxes)):
+                    cx = (pred_boxes[p_idx, 0] + pred_boxes[p_idx, 2]) / 2
+                    cy = (pred_boxes[p_idx, 1] + pred_boxes[p_idx, 3]) / 2
+                    
+                    anchor_px = anchors.T * strides.unsqueeze(1)
+                    dist = ((anchor_px[:, 0].cpu() - cx) ** 2 + (anchor_px[:, 1].cpu() - cy) ** 2)
+                    nearest_idx = dist.argmin().item()
+                    
+                    det_feats.append(region_features[:, nearest_idx])
+                
+                if det_feats:
+                    det_region_features = torch.stack(det_feats).unsqueeze(0)  # [1, N, embed]
+            
+            # Logger에 전달 (image_path + region_feature 포함)
             logger.process_batch(
                 preds=torch.cat([pred_boxes, pred_confs.unsqueeze(1), pred_classes.unsqueeze(1).float()], dim=1).unsqueeze(0),
                 gt_bboxes=[gt_boxes],
                 gt_classes=[gt_classes],
                 image_ids=[img_id],
                 image_paths=[img_path],
+                region_features=det_region_features,
             )
         
         if verbose and batch_idx % 100 == 0:
@@ -497,36 +533,91 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (image embedding도 함께 수집)
-    print("\n--- Semantic Uncertainty Calculation ---")
+    # 3.3 u_sem 계산 (YOLOE region feature + MobileCLIP embeddings)
+    print("\n--- Semantic Uncertainty Calculation (YOLOE region feature) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
+        model=model,
         class_names=class_names,
         device=config.device,
         temperature=10.0,
         top_m=config.top_m_classes,
     )
     
-    # 유닛테스트: 첫 번째 detection에 대해 view 간 차이 확인
-    print("\n--- U_SEM Unit Test (첫 번째 샘플) ---")
+    # Region feature 유무 확인
+    has_region_features = False
     for group_name, detections in matched_data.items():
-        if isinstance(detections, list) and len(detections) > 0:
-            print(f"\nTesting from {group_name}:")
-            u_sem_calculator.unit_test_single_detection(detections[0])
-            break
+        if isinstance(detections, list):
+            for det in detections[:10]:  # 샘플 체크
+                if det.region_feature is not None:
+                    has_region_features = True
+                    break
+            if has_region_features:
+                break
     
-    # u_sem 계산 + image embedding 수집
+    if has_region_features:
+        print("  Region features available (fuse 전 캡처됨)")
+    else:
+        print("  WARNING: Region features not available (model was fused)")
+        print("  u_sem will be computed from stored features if available")
+    
+    # u_sem, artifactness 계산
     u_sem_by_group = {}
-    image_embs_by_group = {}
+    s_art_by_group = {}
     drop_stats_by_group = {}
     
     for group_name, detections in matched_data.items():
         if not isinstance(detections, list) or len(detections) == 0:
             continue
+        
         print(f"\n  Computing u_sem for {group_name} ({len(detections)} samples)...")
-        u_sems, image_embs, drop_stats = u_sem_calculator.compute_for_detections(detections, verbose=True)
-        u_sem_by_group[group_name] = u_sems
-        image_embs_by_group[group_name] = image_embs
-        drop_stats_by_group[group_name] = drop_stats
+        
+        u_sems = []
+        s_arts = []
+        valid_count = 0
+        no_feature_count = 0
+        
+        for det in detections:
+            if det.region_feature is not None:
+                # region feature가 있으면 직접 계산
+                feat = det.region_feature
+                
+                # u_sem: Top-M gating + JS
+                base_logits = np.dot(u_sem_calculator.attr_emb.base_embeddings, feat) / u_sem_calculator.temperature
+                base_posterior = softmax(base_logits)
+                top_m_indices = np.argsort(base_posterior)[-u_sem_calculator.top_m:]
+                
+                posteriors = []
+                for view_name in u_sem_calculator.attr_emb.view_names:
+                    view_emb = u_sem_calculator.attr_emb.view_embeddings[view_name]
+                    top_m_emb = view_emb[top_m_indices]
+                    logits = np.dot(top_m_emb, feat) / u_sem_calculator.temperature
+                    posteriors.append(softmax(logits))
+                
+                posteriors = np.stack(posteriors, axis=0)
+                u_sem = js_divergence(posteriors)
+                
+                # artifactness
+                dep_sims = np.dot(u_sem_calculator.attr_emb.depiction_embeddings, feat)
+                real_sims = np.dot(u_sem_calculator.attr_emb.real_embeddings, feat)
+                s_art = float(np.max(dep_sims) - np.max(real_sims))
+                
+                u_sems.append(u_sem)
+                s_arts.append(s_art)
+                valid_count += 1
+            else:
+                u_sems.append(0.0)
+                s_arts.append(0.0)
+                no_feature_count += 1
+        
+        u_sem_by_group[group_name] = np.array(u_sems)
+        s_art_by_group[group_name] = np.array(s_arts)
+        drop_stats_by_group[group_name] = {
+            "total": len(detections),
+            "valid": valid_count,
+            "no_region_feature": no_feature_count,
+        }
+        
+        print(f"    Valid: {valid_count}/{len(detections)}, no_feature: {no_feature_count}")
     
     # u_sem 통계
     print(f"\n  u_sem statistics:")
@@ -541,49 +632,41 @@ def run_evaluation_phase(config: ExperimentConfig,
     
     # 3.4 Enhanced Triad Split (artifactness score 기반)
     print("\n--- Enhanced Triad Split (artifactness-based) ---")
-    enhanced_splitter = EnhancedTriadSplit(
-        scorer=u_sem_calculator.scorer,
-        depiction_threshold=0.0,  # margin > 0 이면 depiction 우세
-    )
+    enhanced_splitter = EnhancedTriadSplit(depiction_threshold=0.0)
     
-    # 모든 detection과 image_emb를 합쳐서 enhanced split
+    # 모든 detection과 artifactness score를 합쳐서 enhanced split
     all_detections = []
-    all_embs = []
+    all_s_arts = []
     all_u_sems = []
     
     for group_name, detections in matched_data.items():
         if not isinstance(detections, list):
             continue
-        embs = image_embs_by_group.get(group_name, [None] * len(detections))
+        s_arts = s_art_by_group.get(group_name, np.zeros(len(detections)))
         u_sems = u_sem_by_group.get(group_name, np.zeros(len(detections)))
         
-        for det, emb, u in zip(detections, embs, u_sems):
+        for det, s, u in zip(detections, s_arts, u_sems):
             all_detections.append(det)
-            all_embs.append(emb)
+            all_s_arts.append(s)
             all_u_sems.append(u)
     
-    enhanced_groups = enhanced_splitter.split_detections(all_detections, all_embs)
+    enhanced_groups = enhanced_splitter.split_detections(all_detections, np.array(all_s_arts))
     enhanced_splitter.print_split_stats(enhanced_groups)
     
     # Enhanced groups에서 u_sem 재구성
     enhanced_u_sem = {}
+    enhanced_s_art = {}
     enhanced_detections = {}
+    
     for group_name, items in enhanced_groups.items():
         if items:
             enhanced_detections[group_name] = [det for det, _ in items]
-            # 해당 detection들의 u_sem 찾기
+            # 해당 detection들의 u_sem, s_art 찾기
             det_set = set(id(det) for det, _ in items)
             u_sems_for_group = [u for det, u in zip(all_detections, all_u_sems) if id(det) in det_set]
+            s_arts_for_group = [s for det, s in zip(all_detections, all_s_arts) if id(det) in det_set]
             enhanced_u_sem[group_name] = np.array(u_sems_for_group)
-    
-    # 3.5 Artifactness Score 통계
-    print("\n--- Artifactness Score Statistics ---")
-    s_art_by_group = {}
-    for group_name, items in enhanced_groups.items():
-        if items:
-            scores = np.array([s for _, s in items])
-            s_art_by_group[group_name] = scores
-            print(f"    {group_name}: mean={scores.mean():.4f}, std={scores.std():.4f}, n={len(scores)}")
+            enhanced_s_art[group_name] = np.array(s_arts_for_group)
     
     # 3.6 H1 검증 (두 가지: 기존 Semantic_FP + 새로운 Depiction_FP)
     print("\n--- H1 Verification ---")
@@ -649,8 +732,9 @@ def run_evaluation_phase(config: ExperimentConfig,
             u_sem_stats[group] = {"mean": float(valid.mean()), "std": float(valid.std()), "n": int(len(valid))}
     
     s_art_stats = {}
-    for group, s_arts in s_art_by_group.items():
-        s_art_stats[group] = {"mean": float(s_arts.mean()), "std": float(s_arts.std()), "n": int(len(s_arts))}
+    for group, s_arts in enhanced_s_art.items():
+        if len(s_arts) > 0:
+            s_art_stats[group] = {"mean": float(s_arts.mean()), "std": float(s_arts.std()), "n": int(len(s_arts))}
     
     # JSON 결과
     results = {
@@ -661,7 +745,7 @@ def run_evaluation_phase(config: ExperimentConfig,
             "top_m": config.top_m_classes,
             "num_views": config.num_attribute_views,
             "temperature": 10.0,
-            "model_used": u_sem_calculator.scorer.model_name,
+            "method": "YOLOE_region_feature + MobileCLIP_embeddings",
         },
         "detection_stats": logger.get_stats(),
         "enhanced_split": {k: len(v) for k, v in enhanced_groups.items()},

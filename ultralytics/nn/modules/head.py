@@ -465,9 +465,20 @@ class YOLOEDetect(Detect):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         has_lrpc = hasattr(self, "lrpc")
         masks = [] if has_lrpc else None
+        
+        # Region feature 저장용 (fuse 전에만 유효)
+        region_features = []
+        
         for i in range(self.nl):
             if not has_lrpc:
-                x[i] = torch.cat((self.cv2[i](x[i]), self.cv4[i](self.cv3[i](x[i]), cls_pe)), 1)
+                # cv3 출력 = region feature (512-dim, text embedding과 matmul 전)
+                region_feat = self.cv3[i](x[i])  # [B, embed, H, W]
+                cls_out = self.cv4[i](region_feat, cls_pe)
+                x[i] = torch.cat((self.cv2[i](x[i]), cls_out), 1)
+                
+                # fuse 전에만 region feature 저장 (512-dim 체크)
+                if not self.is_fused and region_feat.shape[1] == self.embed:
+                    region_features.append(region_feat)
             else:
                 assert(self.is_fused)
                 cls_feat = self.cv3[i](x[i])
@@ -516,6 +527,13 @@ class YOLOEDetect(Detect):
         
         # class score tensor 저장 (semantic uncertainty 계산용)
         self._last_cls = cls  # [B, nc, num_anchors] - logits (sigmoid 전)
+        
+        # region feature 저장 (fuse 전에만)
+        if region_features:
+            # [B, embed, H, W] -> [B, embed, num_anchors] 로 flatten
+            self._region_features = torch.cat([rf.flatten(2) for rf in region_features], dim=2)
+        else:
+            self._region_features = None
         
         y = torch.cat((dbox, cls.sigmoid()), 1)
         

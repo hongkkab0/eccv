@@ -67,7 +67,8 @@ from .semantic_uncertainty import (
     js_divergence,
     SemanticUncertaintyCalculator,
     EnhancedTriadSplit,
-    MobileCLIPScorer,
+    YOLOERegionFeatureExtractor,
+    MobileCLIPAttributeEmbeddings,
 )
 
 from .artifactness_score import (
