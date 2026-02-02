@@ -114,28 +114,21 @@ def run_detection_phase(config: ExperimentConfig,
     print("Phase 1: Detection and Triad Split")
     print("="*60)
     
-    # CRITICAL: fuse 상태 확인 (detection phase 시작 전)
+    # fuse 상태 확인 (경고만, 실패 아님 - cls_logits는 fused에서도 사용 가능)
     head = model.model.model[-1]
     cv3_out_dim = head.cv3[0][-1].weight.shape[0] if hasattr(head, 'cv3') else -1
     embed_dim = head.embed if hasattr(head, 'embed') else 512
+    is_fused = cv3_out_dim != embed_dim
     
-    print(f"  Checking model fuse status...")
+    print(f"  Model fuse status:")
     print(f"    cv3 output dim: {cv3_out_dim}")
     print(f"    embed_dim: {embed_dim}")
-    print(f"    is_fused flag: {head.is_fused if hasattr(head, 'is_fused') else 'N/A'}")
+    print(f"    is_fused: {is_fused}")
     
-    if cv3_out_dim != embed_dim:
-        raise RuntimeError(
-            f"\n\nFATAL: Model is FUSED - cannot capture 512-dim region features!\n"
-            f"  cv3 outputs {cv3_out_dim} dims instead of {embed_dim}\n\n"
-            f"SOLUTION:\n"
-            f"  1. Use unfused checkpoint (download original YOLOE weights)\n"
-            f"  2. Or check if checkpoint was saved after fuse() call\n\n"
-            f"Current checkpoint may have been created with:\n"
-            f"  model.fuse() or get_vocab() which calls fuse() internally"
-        )
+    if is_fused:
+        print(f"  NOTE: Model is fused - will use cls_logits for u_sem (no 512-dim features)")
     else:
-        print(f"    OK: Model is NOT fused - 512-dim features will be captured")
+        print(f"  OK: Model is NOT fused - 512-dim features available")
     
     # 데이터 로더 준비
     data = check_det_dataset(config.data_yaml)
@@ -280,6 +273,18 @@ def run_detection_phase(config: ExperimentConfig,
         if hasattr(head, '_region_features') and head._region_features is not None:
             region_features = head._region_features[0].cpu()  # [embed, num_anchors]
         
+        # cls_logits 캡처 (항상 유효 - fused 모델에서도)
+        cls_logits = None
+        if hasattr(head, '_last_cls') and head._last_cls is not None:
+            cls_logits = head._last_cls[0].cpu()  # [nc, num_anchors]
+        
+        # anchor 정보 캡처
+        anchor_xy = None
+        anchor_strides = None
+        if hasattr(head, '_last_anchor_xy') and head._last_anchor_xy is not None:
+            anchor_xy = head._last_anchor_xy.cpu()  # [num_anchors, 2]
+            anchor_strides = head._last_strides.cpu()  # [num_anchors]
+        
         # 이미지 파일 경로 추출
         im_files = batch.get("im_file", [None] * len(results))
         
@@ -399,27 +404,39 @@ def run_detection_phase(config: ExperimentConfig,
                 
                 print(f"\n  IoU matrix stats: max={ious_debug.max().item():.3f}, mean={ious_debug.mean().item():.3f}")
             
-            # Detection별 region feature 추출 (bbox 중심에 가장 가까운 anchor)
+            # Detection별 feature/logits 추출 (bbox 중심에 가장 가까운 anchor)
             det_region_features = None
-            if region_features is not None and hasattr(head, 'anchors') and head.anchors is not None:
-                anchors = head.anchors  # [2, num_anchors]
-                strides = head.strides  # [num_anchors]
+            det_cls_logits = None
+            
+            if anchor_xy is not None and anchor_strides is not None:
+                # anchor를 픽셀 좌표로 변환
+                anchor_px = anchor_xy * anchor_strides.unsqueeze(1)  # [A, 2]
                 
                 det_feats = []
+                det_logits = []
+                
                 for p_idx in range(len(pred_boxes)):
                     cx = (pred_boxes[p_idx, 0] + pred_boxes[p_idx, 2]) / 2
                     cy = (pred_boxes[p_idx, 1] + pred_boxes[p_idx, 3]) / 2
                     
-                    anchor_px = anchors.T * strides.unsqueeze(1)
-                    dist = ((anchor_px[:, 0].cpu() - cx) ** 2 + (anchor_px[:, 1].cpu() - cy) ** 2)
+                    # nearest anchor 찾기
+                    dist = ((anchor_px[:, 0] - cx) ** 2 + (anchor_px[:, 1] - cy) ** 2)
                     nearest_idx = dist.argmin().item()
                     
-                    det_feats.append(region_features[:, nearest_idx])
+                    # region feature (있으면)
+                    if region_features is not None:
+                        det_feats.append(region_features[:, nearest_idx])
+                    
+                    # cls logits (항상)
+                    if cls_logits is not None:
+                        det_logits.append(cls_logits[:, nearest_idx])
                 
                 if det_feats:
                     det_region_features = torch.stack(det_feats).unsqueeze(0)  # [1, N, embed]
+                if det_logits:
+                    det_cls_logits = torch.stack(det_logits).unsqueeze(0)  # [1, N, nc]
             
-            # Logger에 전달 (image_path + region_feature 포함)
+            # Logger에 전달 (image_path + region_feature + cls_logits 포함)
             logger.process_batch(
                 preds=torch.cat([pred_boxes, pred_confs.unsqueeze(1), pred_classes.unsqueeze(1).float()], dim=1).unsqueeze(0),
                 gt_bboxes=[gt_boxes],
@@ -427,6 +444,7 @@ def run_detection_phase(config: ExperimentConfig,
                 image_ids=[img_id],
                 image_paths=[img_path],
                 region_features=det_region_features,
+                cls_logits=det_cls_logits,
             )
         
         if verbose and batch_idx % 100 == 0:
@@ -579,16 +597,31 @@ def run_evaluation_phase(config: ExperimentConfig,
             if has_region_features:
                 break
     
+    # cls_logits 유무 확인 (fused 모델에서도 사용 가능)
+    has_cls_logits = False
+    sample_logits = None
+    for group_name, detections in matched_data.items():
+        if isinstance(detections, list):
+            for det in detections[:10]:
+                if det.cls_logits is not None:
+                    has_cls_logits = True
+                    sample_logits = det.cls_logits
+                    break
+            if has_cls_logits:
+                break
+    
     if has_region_features:
-        print(f"  Region features available!")
+        print(f"  Region features available (unfused model)")
         print(f"  Sample feature: shape={sample_feat.shape}, norm={np.linalg.norm(sample_feat):.4f}")
+    elif has_cls_logits:
+        print(f"  Region features NOT available (fused model)")
+        print(f"  Using cls_logits instead: shape={sample_logits.shape}")
+        print(f"  NOTE: u_sem will use entropy-based method (not JS divergence)")
     else:
         raise RuntimeError(
-            "FATAL: No region features found in cached detections.\n"
-            "This means:\n"
-            "  1. Model was fused during detection phase, OR\n"
-            "  2. Detection cache was created with fused model.\n"
-            "Solution: Delete cache and re-run with unfused model."
+            "FATAL: No region features AND no cls_logits found.\n"
+            "This means detection cache is corrupted or incomplete.\n"
+            "Solution: Delete cache and re-run detection phase."
         )
     
     # Sanity check (첫 번째 샘플)

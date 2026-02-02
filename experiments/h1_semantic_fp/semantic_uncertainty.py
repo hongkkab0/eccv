@@ -315,9 +315,36 @@ class SemanticUncertaintyCalculator:
         
         print(f"    Temperature: {self.temperature}, Top-M: {self.top_m}")
     
+    def compute_u_sem_from_logits(self, cls_logits: np.ndarray) -> float:
+        """
+        cls_logits에서 uncertainty 계산 (fused 모델용)
+        
+        fused 모델에서는 view별 분포를 얻을 수 없으므로,
+        base logits의 top-M 엔트로피를 사용
+        
+        Args:
+            cls_logits: [nc] pre-sigmoid logits
+        
+        Returns:
+            uncertainty 값 (normalized entropy)
+        """
+        if cls_logits is None:
+            return 0.0
+        
+        # Top-M logits → posterior
+        top_m_indices = np.argsort(cls_logits)[-self.top_m:]
+        top_m_logits = cls_logits[top_m_indices] / self.temperature
+        top_m_posterior = softmax(top_m_logits)
+        
+        # Normalized entropy (0~1)
+        h = entropy(top_m_posterior + 1e-10)
+        h_max = np.log(self.top_m)  # maximum entropy
+        
+        return float(h / h_max) if h_max > 0 else 0.0
+    
     def compute_u_sem(self, region_feature: np.ndarray) -> float:
         """
-        단일 region feature의 u_sem 계산
+        단일 region feature의 u_sem 계산 (unfused 모델용)
         
         Args:
             region_feature: [512] anchor feature
@@ -379,19 +406,33 @@ class SemanticUncertaintyCalculator:
         """
         단일 detection의 u_sem, s_art 계산
         
+        우선순위:
+        1. region_feature가 있으면: full u_sem (JS divergence) + artifactness
+        2. cls_logits만 있으면: entropy-based uncertainty + artifactness=0
+        3. 둘 다 없으면: drop
+        
         Returns:
             (u_sem, s_art, debug_info)
         """
-        debug_info = {"status": "ok"}
+        debug_info = {"status": "ok", "source": "none"}
         
-        if detection.region_feature is None:
-            return 0.0, 0.0, {"status": "dropped", "reason": "no_region_feature"}
+        # 1. region_feature가 있으면 (unfused 모델)
+        if detection.region_feature is not None:
+            feat = detection.region_feature
+            u_sem = self.compute_u_sem(feat)
+            s_art = self.compute_artifactness(feat)
+            debug_info["source"] = "region_feature"
+            return u_sem, s_art, debug_info
         
-        feat = detection.region_feature
-        u_sem = self.compute_u_sem(feat)
-        s_art = self.compute_artifactness(feat)
+        # 2. cls_logits만 있으면 (fused 모델)
+        if detection.cls_logits is not None:
+            u_sem = self.compute_u_sem_from_logits(detection.cls_logits)
+            s_art = 0.0  # fused 모델에서는 artifactness 계산 불가
+            debug_info["source"] = "cls_logits"
+            return u_sem, s_art, debug_info
         
-        return u_sem, s_art, debug_info
+        # 3. 둘 다 없으면 drop
+        return 0.0, 0.0, {"status": "dropped", "reason": "no_feature_or_logits"}
     
     def compute_for_detections(self, detections: List[Detection], 
                                verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, Dict]:
@@ -407,7 +448,9 @@ class SemanticUncertaintyCalculator:
         drop_stats = {
             "total": len(detections),
             "valid": 0,
-            "no_region_feature": 0,
+            "from_region_feature": 0,
+            "from_cls_logits": 0,
+            "dropped": 0,
         }
         
         for i, det in enumerate(detections):
@@ -420,12 +463,18 @@ class SemanticUncertaintyCalculator:
             
             if info["status"] == "ok":
                 drop_stats["valid"] += 1
+                if info.get("source") == "region_feature":
+                    drop_stats["from_region_feature"] += 1
+                elif info.get("source") == "cls_logits":
+                    drop_stats["from_cls_logits"] += 1
             else:
-                drop_stats["no_region_feature"] += 1
+                drop_stats["dropped"] += 1
         
         if verbose:
-            print(f"    Drop stats: valid={drop_stats['valid']}/{drop_stats['total']}, "
-                  f"no_feature={drop_stats['no_region_feature']}")
+            print(f"    Drop stats: valid={drop_stats['valid']}/{drop_stats['total']}")
+            print(f"      from_region_feature: {drop_stats['from_region_feature']}")
+            print(f"      from_cls_logits: {drop_stats['from_cls_logits']}")
+            print(f"      dropped: {drop_stats['dropped']}")
         
         return np.array(u_sems), np.array(s_arts), drop_stats
     

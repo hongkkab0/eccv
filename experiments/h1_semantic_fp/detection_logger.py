@@ -35,8 +35,11 @@ class Detection:
     # 이미지 경로 (CLIP crop embedding 계산용)
     image_path: Optional[str] = None
     
-    # Region feature (CLIP space)
+    # Region feature (CLIP space, 512-dim - unfused 모델에서만)
     region_feature: Optional[np.ndarray] = None  # [embed_dim]
+    
+    # Class logits (항상 사용 가능 - fused 모델에서도)
+    cls_logits: Optional[np.ndarray] = None  # [nc] - pre-sigmoid logits
     
     # Top-K class scores (for gating)
     top_k_classes: Optional[np.ndarray] = None  # [K]
@@ -109,7 +112,8 @@ class DetectionLogger:
                       image_ids: List[str],
                       image_paths: Optional[List[str]] = None,
                       region_features: Optional[torch.Tensor] = None,
-                      class_scores: Optional[torch.Tensor] = None):
+                      class_scores: Optional[torch.Tensor] = None,
+                      cls_logits: Optional[torch.Tensor] = None):
         """
         배치 처리: detection 결과와 GT를 매칭하여 TP/FP 분류
         
@@ -119,8 +123,9 @@ class DetectionLogger:
             gt_classes: List of [M] per image  
             image_ids: 이미지 ID 리스트
             image_paths: 이미지 경로 리스트 (CLIP crop embedding용)
-            region_features: [B, N, embed_dim] (optional)
+            region_features: [B, N, embed_dim] (optional, unfused 모델에서만)
             class_scores: [B, N, num_classes] (optional)
+            cls_logits: [B, N, nc] (optional, 항상 사용 가능)
         """
         batch_size = len(image_ids)
         
@@ -141,9 +146,11 @@ class DetectionLogger:
             # 이미지 경로
             img_path = image_paths[b] if image_paths is not None else None
             
-            # Region features (있는 경우)
+            # Region features (있는 경우 - unfused 모델에서만)
             reg_feats = region_features[b] if region_features is not None else None
             cls_scores = class_scores[b] if class_scores is not None else None
+            # cls_logits (항상 사용 가능)
+            det_cls_logits = cls_logits[b] if cls_logits is not None else None
             
             # IoU 계산
             if gt_box.numel() > 0 and pred_boxes.numel() > 0:
@@ -164,6 +171,7 @@ class DetectionLogger:
                     det_gt_ious=ious[det_idx].cpu().numpy() if ious.numel() > 0 else np.array([]),
                     region_feat=reg_feats[det_idx].cpu().numpy() if reg_feats is not None else None,
                     cls_scores=cls_scores[det_idx].cpu().numpy() if cls_scores is not None else None,
+                    cls_logits=det_cls_logits[det_idx].cpu().numpy() if det_cls_logits is not None else None,
                     image_path=img_path,
                 )
                 
@@ -189,6 +197,7 @@ class DetectionLogger:
                                    det_gt_ious: np.ndarray,
                                    region_feat: Optional[np.ndarray],
                                    cls_scores: Optional[np.ndarray],
+                                   cls_logits: Optional[np.ndarray] = None,
                                    image_path: Optional[str] = None) -> Detection:
         """단일 detection 처리"""
         
@@ -208,6 +217,7 @@ class DetectionLogger:
             confidence=pred_conf,
             image_path=image_path,
             region_feature=region_feat,
+            cls_logits=cls_logits,
             top_k_classes=top_k_classes,
             top_k_scores=top_k_scores,
         )

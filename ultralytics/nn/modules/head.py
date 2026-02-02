@@ -530,7 +530,7 @@ class YOLOEDetect(Detect):
         self._last_cls = cls  # [B, nc, num_anchors] - logits (sigmoid 전)
         
         # 2. anchor xy 좌표 (bbox center 매칭용)
-        self._last_anchor_xy = self.anchors.T  # [num_anchors, 2] (x, y)
+        self._last_anchor_xy = self.anchors.T  # [num_anchors, 2] (x, y in grid units)
         self._last_strides = self.strides  # [num_anchors]
         
         # 3. region feature (fuse 전에만, 512-dim)
@@ -538,6 +538,21 @@ class YOLOEDetect(Detect):
             self._region_features = torch.cat([rf.flatten(2) for rf in region_features], dim=2)
         else:
             self._region_features = None
+        
+        # DEBUG: shape 출력 (첫 번째 forward에서만)
+        if not hasattr(self, '_debug_printed'):
+            self._debug_printed = True
+            print(f"\n[HEAD DEBUG] Tensor shapes:")
+            print(f"  cls (logits): {cls.shape}")  # [B, nc, A] or [B, A, nc]
+            print(f"  anchors: {self.anchors.shape}")  # [2, A]
+            print(f"  anchor_xy: {self._last_anchor_xy.shape}")  # [A, 2]
+            print(f"  strides: {self._last_strides.shape}")  # [A]
+            if region_features:
+                print(f"  region_features: {self._region_features.shape}")  # [B, embed, A]
+            else:
+                print(f"  region_features: None (model is fused)")
+            print(f"  is_fused: {self.is_fused}")
+            print()
         # ====================================================
         
         y = torch.cat((dbox, cls.sigmoid()), 1)
