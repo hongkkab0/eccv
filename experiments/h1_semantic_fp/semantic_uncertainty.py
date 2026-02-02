@@ -394,15 +394,17 @@ class EnhancedTriadSplit:
         Returns:
             "TP", "ClassConfusion_FP", "Depiction_FP", "Background_FP"
         """
-        if detection.category == "TP" or detection.is_tp:
+        # TP 판정
+        if detection.is_tp:
             return "TP"
         
-        if detection.category == "Background_FP" or detection.matched_gt_idx is None:
+        # Background FP: GT와 매칭 안 됨
+        if detection.matched_gt_idx is None:
             return "Background_FP"
         
         # Semantic FP → 세분화
-        # GT 클래스가 depiction/replica 클래스인지 확인
-        gt_class = detection.gt_class
+        # matched_gt_class 사용 (gt_class가 아님)
+        gt_class = detection.matched_gt_class
         pred_class = detection.pred_class
         
         # GT나 Pred 중 하나라도 depiction/replica면 Depiction_FP
