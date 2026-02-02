@@ -43,7 +43,6 @@ from .attribute_embeddings import (
 )
 from .semantic_uncertainty import (
     SemanticUncertaintyCalculator,
-    YOLOEFeatureExtractor,
     analyze_u_sem_statistics,
 )
 from .artifactness_score import (
@@ -221,10 +220,6 @@ def run_detection_phase(config: ExperimentConfig,
     
     print(f"Processing {total_images} images...")
     
-    # YOLOE Feature Extractor 초기화
-    feature_extractor = YOLOEFeatureExtractor(model, device=config.device)
-    print(f"  Initialized YOLOE feature extractor (extracting cv3 visual embeddings)")
-    
     # 진단용 카운터
     tp_any_count = 0  # IoU만으로 TP (클래스 무시)
     tp_class_count = 0  # IoU + 클래스 일치 TP
@@ -246,10 +241,7 @@ def run_detection_phase(config: ExperimentConfig,
         if imgs.max() > 1.0:
             imgs = imgs / 255.0
         
-        # Feature extractor 초기화
-        feature_extractor.clear()
-        
-        # 추론 (hook이 cv3 feature 캡처)
+        # 추론
         with torch.no_grad():
             results = model.predict(imgs, verbose=False, conf=config.conf_threshold)
         
@@ -372,59 +364,13 @@ def run_detection_phase(config: ExperimentConfig,
                 
                 print(f"\n  IoU matrix stats: max={ious_debug.max().item():.3f}, mean={ious_debug.mean().item():.3f}")
             
-            # YOLOE visual feature 추출 (cv3 output)
-            region_feats = None
-            if len(feature_extractor.cv3_features) > 0:
-                head = model.model.model[-1]
-                head_strides = head.stride.to(pred_boxes.device)
-                
-                # 각 detection에 대해 feature 추출
-                feats_list = []
-                for box in pred_boxes:
-                    # box 중심점 계산
-                    cx = (box[0] + box[2]) / 2
-                    cy = (box[1] + box[3]) / 2
-                    
-                    # 가장 적합한 scale 선택 (box 크기 기준)
-                    box_size = max(box[2] - box[0], box[3] - box[1])
-                    best_scale_idx = 0
-                    min_diff = float('inf')
-                    for si, stride in enumerate(head_strides):
-                        # stride가 box 크기의 1/8~1/4 정도인 scale이 적합
-                        target_stride = box_size / 4
-                        diff = abs(stride.item() - target_stride)
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_scale_idx = si
-                    
-                    # 해당 scale의 feature map에서 feature 추출
-                    feat_map = feature_extractor.cv3_features[best_scale_idx]  # [B, embed_dim, H, W]
-                    stride = head_strides[best_scale_idx].item()
-                    
-                    # feature map 좌표
-                    fx = int(cx / stride)
-                    fy = int(cy / stride)
-                    
-                    # 범위 체크
-                    _, _, H, W = feat_map.shape
-                    fx = min(max(fx, 0), W - 1)
-                    fy = min(max(fy, 0), H - 1)
-                    
-                    # feature 추출 (batch=0)
-                    feat = feat_map[0, :, fy, fx]  # [embed_dim]
-                    feats_list.append(feat)
-                
-                if len(feats_list) > 0:
-                    region_feats = torch.stack(feats_list).unsqueeze(0)  # [1, N, embed_dim]
-            
-            # Logger에 전달
+            # Logger에 전달 (image_path 포함 - Phase 3에서 attribute inference용)
             logger.process_batch(
                 preds=torch.cat([pred_boxes, pred_confs.unsqueeze(1), pred_classes.unsqueeze(1).float()], dim=1).unsqueeze(0),
                 gt_bboxes=[gt_boxes],
                 gt_classes=[gt_classes],
                 image_ids=[img_id],
                 image_paths=[img_path],
-                region_features=region_feats,
             )
         
         if verbose and batch_idx % 100 == 0:
@@ -468,11 +414,6 @@ def run_detection_phase(config: ExperimentConfig,
         print(f"\n[DIAGNOSIS] Mismatch examples (first 20 of {len(mismatch_examples)}):")
         for ex in mismatch_examples[:20]:
             print(f"    {ex}")
-    
-    # Feature extractor hooks 제거
-    feature_extractor.remove_hooks()
-    feat_count = sum(1 for d in logger.detections if d.region_feature is not None)
-    print(f"  Saved {feat_count} visual features (for cv4 attribute score calculation in Phase 3)")
     
     return logger
 
@@ -556,20 +497,16 @@ def run_evaluation_phase(config: ExperimentConfig,
         print("  WARNING: Confidence matching failed. Using unmatched data.")
         matched_data = triad_split
     
-    # 3.3 u_sem 계산 (YOLOE cv4 사용)
-    print("\n--- Semantic Uncertainty Calculation (YOLOE cv4 scores) ---")
+    # 3.3 u_sem 계산 (YOLOE attribute inference)
+    print("\n--- Semantic Uncertainty Calculation (YOLOE attribute inference) ---")
     u_sem_calculator = SemanticUncertaintyCalculator(
         attribute_cache=attribute_cache,
         class_names=class_names,
-        model=model,  # cv4 접근용
+        model=model,  # attribute inference용
         top_m=config.top_m_classes,
         device=config.device,
     )
-    
-    # Detection에 이미 추출된 region_feature 사용
-    # (region_feature가 없는 경우만 CLIP fallback)
-    has_features = sum(1 for d in matched_data["TP"] if d.region_feature is not None)
-    print(f"  Detections with YOLOE features: {has_features}/{len(matched_data['TP'])} (TP)")
+    print(f"  Will run YOLOE inference with attribute embeddings for each detection")
     
     # YOLOE feature로 u_sem 계산
     u_sem_by_group = {}
