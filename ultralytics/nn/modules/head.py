@@ -525,15 +525,20 @@ class YOLOEDetect(Detect):
             mask = torch.cat(masks)
             dbox = dbox[:, :, mask]
         
-        # class score tensor 저장 (semantic uncertainty 계산용)
+        # ========== Semantic Uncertainty용 저장 ==========
+        # 1. class logits (항상 저장, fused/unfused 모두 사용 가능)
         self._last_cls = cls  # [B, nc, num_anchors] - logits (sigmoid 전)
         
-        # region feature 저장 (fuse 전에만)
+        # 2. anchor xy 좌표 (bbox center 매칭용)
+        self._last_anchor_xy = self.anchors.T  # [num_anchors, 2] (x, y)
+        self._last_strides = self.strides  # [num_anchors]
+        
+        # 3. region feature (fuse 전에만, 512-dim)
         if region_features:
-            # [B, embed, H, W] -> [B, embed, num_anchors] 로 flatten
             self._region_features = torch.cat([rf.flatten(2) for rf in region_features], dim=2)
         else:
             self._region_features = None
+        # ====================================================
         
         y = torch.cat((dbox, cls.sigmoid()), 1)
         

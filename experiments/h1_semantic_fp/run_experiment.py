@@ -560,8 +560,13 @@ def run_evaluation_phase(config: ExperimentConfig,
         print(f"  Region features available!")
         print(f"  Sample feature: shape={sample_feat.shape}, norm={np.linalg.norm(sample_feat):.4f}")
     else:
-        print("  WARNING: No region features found.")
-        print("  Check if model is fused - fused models don't provide 512-dim features.")
+        raise RuntimeError(
+            "FATAL: No region features found in cached detections.\n"
+            "This means:\n"
+            "  1. Model was fused during detection phase, OR\n"
+            "  2. Detection cache was created with fused model.\n"
+            "Solution: Delete cache and re-run with unfused model."
+        )
     
     # Sanity check (첫 번째 샘플)
     if has_region_features:
@@ -585,6 +590,14 @@ def run_evaluation_phase(config: ExperimentConfig,
         
         print(f"\n  Computing u_sem for {group_name} ({len(detections)} samples)...")
         u_sems, s_arts, drop_stats = u_sem_calculator.compute_for_detections(detections, verbose=True)
+        
+        # CRITICAL: valid==0이면 실패
+        if drop_stats["valid"] == 0:
+            raise RuntimeError(
+                f"FATAL: {group_name} has 0 valid samples (all {drop_stats['total']} dropped).\n"
+                f"Drop stats: {drop_stats}\n"
+                "This invalidates all metrics. Fix region feature extraction first."
+            )
         
         u_sem_by_group[group_name] = u_sems
         s_art_by_group[group_name] = s_arts
@@ -908,15 +921,28 @@ def main():
     model.to(config.device)
     model.eval()
     
-    # fuse 상태 확인
+    # fuse 상태 확인 (CRITICAL)
     head = model.model.model[-1]
-    if hasattr(head, 'is_fused') and head.is_fused:
-        print(f"  WARNING: Model head is already fused.")
-        print(f"  Region features (512-dim) cannot be extracted from fused model.")
-        print(f"  u_sem calculation will be skipped or use fallback.")
+    
+    # 진단: cv3의 마지막 레이어 weight shape으로 fused 여부 확인
+    cv3_out_dim = head.cv3[0][-1].weight.shape[0] if hasattr(head, 'cv3') else -1
+    embed_dim = head.embed if hasattr(head, 'embed') else 512
+    
+    print(f"  cv3 output dim: {cv3_out_dim}")
+    print(f"  embed_dim: {embed_dim}")
+    print(f"  is_fused flag: {head.is_fused if hasattr(head, 'is_fused') else 'N/A'}")
+    
+    if cv3_out_dim != embed_dim:
+        print(f"\n  ERROR: Model is FUSED (cv3 outputs {cv3_out_dim} dims instead of {embed_dim})")
+        print(f"  512-dim region features are NOT available.")
+        print(f"  u_sem calculation requires unfused model.")
+        print(f"\n  SOLUTION: Use unfused checkpoint or disable fuse.")
+        raise RuntimeError(
+            f"Cannot run u_sem experiment: model is fused (cv3_out={cv3_out_dim}, need={embed_dim}). "
+            f"Use unfused checkpoint."
+        )
     else:
-        print(f"  Model head is NOT fused - region features available.")
-        print(f"  embed_dim: {head.embed if hasattr(head, 'embed') else 'unknown'}")
+        print(f"  Model is NOT fused - 512-dim region features available.")
     
     # Phase 1: Detection
     if not args.skip_detection:
